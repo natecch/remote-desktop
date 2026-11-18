@@ -940,7 +940,47 @@ class App:
         self.root.destroy()
 
 
+def selftest():
+    """Check that a packaged build can load and use everything it needs (used by CI).
+    Prints one line per check; returns 0 when all pass."""
+    results = []
+
+    def check(name, fn):
+        try:
+            results.append((True, name, fn() or ""))
+        except Exception as exc:  # report every failure, not just the first
+            results.append((False, name, f"{type(exc).__name__}: {exc}"))
+
+    def tunnel():
+        path = find_cloudflared()
+        if not path:
+            raise FileNotFoundError("cloudflared not bundled")
+        return path
+
+    def window():
+        root = tk.Tk()
+        root.withdraw()
+        App(root)
+        root.update()
+        root.destroy()
+        return "built"
+
+    monitors = []
+    check("screen layout", lambda: f"{len(monitors.extend(host.list_monitors()) or monitors)} monitor(s)")
+    check("screen capture", lambda: f"{len(host.grab_update(0, monitors[0], 1.0, 60, None, -1)[2])} bytes")
+    check("input backend", lambda: host.inp.__name__ + " " + str(host.inp.cursor_info()))
+    check("viewer page", lambda: f"{len((HERE / 'viewer.html').read_bytes())} bytes")
+    check("icon", lambda: f"{(HERE / 'assets' / 'icon-256.png').stat().st_size} bytes")
+    check("tunnel program", tunnel)
+    check("app window", window)
+    for ok, name, detail in results:
+        print("OK  " if ok else "FAIL", name, "-", detail, flush=True)
+    return 0 if all(ok for ok, _, _ in results) else 1
+
+
 def main():
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     root = tk.Tk()
     try:
         ttk.Style().theme_use("vista")

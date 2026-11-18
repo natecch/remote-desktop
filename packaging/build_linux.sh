@@ -25,8 +25,21 @@ pyinstaller --noconfirm --clean --windowed --name RemoteDesktop \
   --add-data "$ROOT/viewer.html:." --add-data "$ROOT/assets/icon-256.png:assets" \
   --add-binary "$ROOT/build/bin/cloudflared:bin" \
   --hidden-import mss.linux --hidden-import PIL._tkinter_finder \
-  --collect-submodules websockets --collect-submodules pynput \
+  --collect-submodules websockets --collect-submodules pynput --collect-submodules Xlib \
+  --hidden-import pynput.keyboard._xorg --hidden-import pynput.mouse._xorg \
+  --hidden-import pynput._util.xorg --hidden-import pynput._util.xorg_keysyms \
   --distpath "$ROOT/build/dist" --workpath "$ROOT/build/work" --specpath "$ROOT/build" app.py
+# pynput picks its backend at run time, so PyInstaller cannot see it; without a display it
+# also cannot import it to collect it. The explicit hidden imports above cover that.
+
+# ---- check the built app actually starts and finds everything (needs a display) ----
+if [ -n "${DISPLAY:-}" ]; then
+  build/dist/RemoteDesktop/RemoteDesktop --selftest
+elif command -v xvfb-run >/dev/null; then
+  xvfb-run -a build/dist/RemoteDesktop/RemoteDesktop --selftest
+else
+  echo "WARNING: no display and no xvfb-run; skipping the self-test" >&2
+fi
 
 # ---- .deb: app in /opt, launcher in /usr/bin, menu entry ----
 PKG="build/deb/remote-desktop_${VERSION}_${ARCH}"

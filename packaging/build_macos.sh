@@ -27,7 +27,12 @@ pyinstaller --noconfirm --clean --windowed --name RemoteDesktop \
   --add-data "$ROOT/viewer.html:." --add-data "$ROOT/assets/icon-256.png:assets" \
   --add-binary "$ROOT/build/bin/cloudflared:bin" \
   --hidden-import mss.darwin --collect-submodules websockets --collect-submodules pynput \
+  --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin \
+  --hidden-import pynput._util.darwin --hidden-import pynput._util.darwin_vks \
   --distpath "$ROOT/build/dist" --workpath "$ROOT/build/work" --specpath "$ROOT/build" app.py
+
+# ---- check the built app actually starts and finds everything ----
+build/dist/RemoteDesktop.app/Contents/MacOS/RemoteDesktop --selftest
 
 DMG="build/installer/RemoteDesktop-${VERSION}-${ARCH}.dmg"
 rm -rf build/dmg "$DMG"
