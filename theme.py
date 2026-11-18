@@ -19,24 +19,31 @@ WINDOWS, MAC = sys.platform == "win32", sys.platform == "darwin"
 FONT = "Segoe UI" if WINDOWS else ("SF Pro Text" if MAC else "Helvetica")
 MONO = "Cascadia Mono" if WINDOWS else "Menlo" if MAC else "Monospace"
 
+# Colours taken from the app icon: cyan-blue (top right) -> royal blue -> deep indigo.
 PALETTES = {
     "light": {
-        "bg": "#f3f4f6", "card": "#ffffff", "border": "#e3e5e8", "text": "#111827", "muted": "#6b7280",
-        "field": "#ffffff", "field_ro": "#f3f4f6", "field_border": "#d1d5db",
-        "button": "#f9fafb", "button_hover": "#eef0f3", "button_press": "#e3e6ea", "button_border": "#d1d5db",
-        "accent": "#2563eb", "accent_hover": "#1d4ed8",
+        "bg": "#eef3fb", "card": "#ffffff", "border": "#e0e7f3", "text": "#0f172a", "muted": "#64748b",
+        "field": "#ffffff", "field_ro": "#f4f7fc", "field_border": "#cfd9ea",
+        "button": "#f6f9fe", "button_hover": "#eaf1fd", "button_press": "#dce7fb", "button_border": "#cfd9ea",
+        "accent": "#1a5cf5", "accent_hover": "#1449d6", "soft": "#e8f0fe", "soft_hover": "#d6e4fd",
+        "indigo": "#3a28c2", "indigo_hover": "#2e1fa3",
+        "side_stops": ("#08a9fe", "#1652f1", "#250c90"), "side_text": "#dbe9ff",
+        "toggle_on": "#1a5cf5", "toggle_off": "#cbd5e1", "toggle_dis": "#e2e8f0", "toggle_dis_on": "#a9c2f8",
         "green": "#16a34a", "green_hover": "#15803d", "red": "#dc2626", "red_hover": "#b91c1c",
-        "amber": "#d97706", "grey": "#9ca3af", "error": "#dc2626",
-        "log": "#f9fafb", "heading": "#f3f4f6", "select": "#dbeafe", "thumb": "#cbd5e1",
+        "amber": "#d97706", "grey": "#94a3b8", "error": "#dc2626",
+        "log": "#f6f9fe", "heading": "#f1f5fc", "select": "#dbe7fe", "thumb": "#c3d0e6",
     },
     "dark": {
-        "bg": "#17181b", "card": "#212226", "border": "#2e3036", "text": "#e8eaed", "muted": "#9aa0a6",
-        "field": "#2a2c31", "field_ro": "#26282c", "field_border": "#3a3d44",
-        "button": "#2c2e33", "button_hover": "#35383e", "button_press": "#3e4148", "button_border": "#3a3d44",
-        "accent": "#3b82f6", "accent_hover": "#2563eb",
+        "bg": "#0f131c", "card": "#171d2a", "border": "#252e40", "text": "#e6ecf7", "muted": "#8b97ad",
+        "field": "#1d2433", "field_ro": "#1a2130", "field_border": "#2f3a50",
+        "button": "#1f2738", "button_hover": "#273147", "button_press": "#303b55", "button_border": "#2f3a50",
+        "accent": "#3b7bff", "accent_hover": "#2c67e8", "soft": "#1c2b4d", "soft_hover": "#243766",
+        "indigo": "#5745e0", "indigo_hover": "#4836c9",
+        "side_stops": ("#0a6fc4", "#1238a8", "#1a0a5e"), "side_text": "#c8dbff",
+        "toggle_on": "#3b7bff", "toggle_off": "#3a465c", "toggle_dis": "#252e40", "toggle_dis_on": "#2b4a85",
         "green": "#22a55b", "green_hover": "#1d8f4f", "red": "#e5484d", "red_hover": "#c93c41",
-        "amber": "#d98a00", "grey": "#6b7280", "error": "#f87171",
-        "log": "#1b1c1f", "heading": "#26282c", "select": "#1e3a8a", "thumb": "#4b5058",
+        "amber": "#d98a00", "grey": "#64748b", "error": "#f87171",
+        "log": "#131926", "heading": "#1d2433", "select": "#1e3a7a", "thumb": "#3a465c",
     },
 }
 
@@ -83,6 +90,7 @@ class Theme:
         self.painted = []    # (widget, {option: palette key})
         self.windows = []
         self.on_change = None
+        self.listeners = []  # custom widgets that redraw themselves on a mode change
         self.style = ttk.Style(root)
         try:
             self.style.theme_use("clam")
@@ -96,6 +104,9 @@ class Theme:
         self.painted.append((widget, options))
         widget.configure(**{opt: self.pal[key] for opt, key in options.items()})
         return widget
+
+    def listen(self, fn):
+        self.listeners.append(fn)
 
     def window(self, win):
         """A Toplevel that should follow the mode (background and title bar)."""
@@ -151,6 +162,11 @@ class Theme:
                 _dark_title_bar(win, dark)
             except tk.TclError:
                 self.windows.remove(win)
+        for fn in list(self.listeners):
+            try:
+                fn()
+            except tk.TclError:
+                self.listeners.remove(fn)
         if self.on_change:
             self.on_change()
 
@@ -211,6 +227,8 @@ class Theme:
                 ("Muted.TLabel", "card", "muted", (FONT, 9)), ("BgMuted.TLabel", "bg", "muted", (FONT, 9)),
                 ("Title.TLabel", "card", "text", (FONT, 13, "bold")),
                 ("Status.TLabel", "bg", "text", (FONT, 15, "bold")),
+                ("Page.TLabel", "bg", "text", (FONT, 18, "bold")),
+                ("Pill.TLabel", "card", "text", (FONT, 10, "bold")),
                 ("Error.TLabel", "card", "error", (FONT, 9)), ("Good.TLabel", "card", "green", base)):
             s.configure(name, background=p[bg], foreground=p[fg], font=font)
 

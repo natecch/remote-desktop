@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-$(python3 -c 'import version; print(version.VERSION)')}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 
 python3 -m venv build/venv

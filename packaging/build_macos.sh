@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-$(python3 -c 'import version; print(version.VERSION)')}"
 case "$(uname -m)" in arm64) ARCH=arm64 ;; *) ARCH=amd64 ;; esac
 
 python3 -m venv build/venv

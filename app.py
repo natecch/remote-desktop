@@ -33,6 +33,7 @@ import rendezvous
 import secure_desktop
 import theme
 import tray
+import ui
 import updater
 from version import VERSION
 
@@ -437,7 +438,9 @@ class App:
                 root.iconphoto(True, self.icon)
         except tk.TclError:
             pass
-        root.minsize(860, 0)
+        scale = root.winfo_fpixels("1i") / 96  # sizes below are at 100% display scaling
+        root.minsize(round(860 * scale), round(560 * scale))
+        root.geometry(f"{round(900 * scale)}x{round(620 * scale)}")
         root.protocol("WM_DELETE_WINDOW", self.hide_window)  # closing keeps it running in the background
         self.theme = theme.Theme(root)  # light or dark, following the system setting
         self.theme.window(root)
@@ -468,211 +471,233 @@ class App:
 
     # ---- layout ----
     def build(self):
-        """Light, simplified layout: two cards (share / connect), connected devices and
-        activity, and everything else under Settings."""
-        root = self.root
-        th = self.theme
+        """Sidebar navigation (Remote, Devices, Chat, Settings) with rounded cards on each page."""
+        root, th = self.root, self.theme
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(0, weight=1)
 
-        def card(parent, title, **grid):
-            frame = th.paint(tk.Frame(parent, highlightthickness=1, padx=20, pady=16),
-                             bg="card", highlightbackground="border", highlightcolor="border")
-            frame.grid(**grid)
-            frame.columnconfigure(0, weight=1)
+        def card(parent, title=None, subtitle=None, **grid):
+            c = ui.RoundCard(parent, th)
+            c.grid(**grid)
             if title:
-                ttk.Label(frame, text=title, style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-            return frame
+                ttk.Label(c.body, text=title, style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+            if subtitle:
+                ttk.Label(c.body, text=subtitle, style="Muted.TLabel", wraplength=440
+                          ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 8))
+            return c.body
+
+        def icon_btn(parent, glyph, command, tip, size, flash=False):
+            return ui.IconButton(parent, th, glyph, command, tip, size=size, flash=flash)
 
         def accent(parent, text, color, command):
             return th.accent_button(parent, text, command, color)
 
-        main = ttk.Frame(root, padding=(18, 14, 18, 16))
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=1)
+        def toggle_row(parent, row, text, desc, variable, command=None):
+            ttk.Label(parent, text=text, style="Card.TLabel").grid(row=row, column=0, sticky="w", pady=(10, 0))
+            if desc:
+                ttk.Label(parent, text=desc, style="Muted.TLabel").grid(row=row + 1, column=0, sticky="w")
+            switch = ui.Toggle(parent, th, variable, command)
+            switch.grid(row=row, column=1, rowspan=2, sticky="e", pady=(10, 0))
+            return switch
 
-        # ---- header: status, version / updates, chat ----
-        head = ttk.Frame(main)
-        head.grid(row=0, column=0, sticky="ew")
-        head.columnconfigure(2, weight=1)
-        self.dot = th.paint(tk.Canvas(head, width=14, height=14, highlightthickness=0), bg="bg")
-        self.dot_id = self.dot.create_oval(2, 2, 12, 12, fill=th.pal["grey"], outline="")
+        # ---- sidebar ----
+        self.sidebar = ui.Sidebar(root, th, "Remote Desktop", str(HERE / "assets" / "icon-256.png"))
+        self.sidebar.grid(row=0, column=0, sticky="ns")
+        self.sidebar.add("remote", "Remote", "", lambda: self.show_page("remote"))
+        self.sidebar.add("devices", "Devices", "", lambda: self.show_page("devices"))
+        self.sidebar.add("chat", "Chat", "", self.open_chat)
+        self.sidebar.add("settings", "Settings", "", lambda: self.show_page("settings"))
+        self.sidebar.set_footer(f"Version {VERSION}")
+
+        content = ttk.Frame(root, padding=(26, 16, 26, 18))
+        content.grid(row=0, column=1, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(1, weight=1)
+
+        # ---- top bar: page title, update status, sharing status ----
+        top = ttk.Frame(content)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        top.columnconfigure(0, weight=1)
+        self.page_title = ttk.Label(top, text="", style="Page.TLabel")
+        self.page_title.grid(row=0, column=0, sticky="w")
+        self.update_label = ttk.Label(top, text=f"Version {VERSION}", style="BgMuted.TLabel")
+        self.update_label.grid(row=0, column=1, padx=(0, 16))
+        pill = ui.RoundCard(top, th, radius=15, pad=(14, 6), fit_width=True)
+        pill.grid(row=0, column=2)
+        self.dot = th.paint(tk.Canvas(pill.body, width=12, height=12, highlightthickness=0), bg="card")
+        self.dot_id = self.dot.create_oval(1, 1, 11, 11, fill=th.pal["grey"], outline="")
         self.dot.grid(row=0, column=0, padx=(0, 8))
-        self.status = ttk.Label(head, text="", style="Status.TLabel")
-        self.status.grid(row=0, column=1, sticky="w")
-        self.update_label = ttk.Label(head, text=f"Version {VERSION}", style="BgMuted.TLabel")
-        self.update_label.grid(row=0, column=3, padx=(0, 8))
-        self.update_btn = ttk.Button(head, text="Check for updates",
-                                     command=lambda: self.check_updates(manual=True))
-        self.update_btn.grid(row=0, column=4, padx=(0, 8))
-        ttk.Button(head, text="Chat", width=8, command=self.open_chat).grid(row=0, column=5)
+        self.status = ttk.Label(pill.body, text="", style="Pill.TLabel")
+        self.status.grid(row=0, column=1)
 
-        # ---- the two cards ----
-        cards = ttk.Frame(main)
-        cards.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        self.pages = {}
+        for key in ("remote", "devices", "settings"):
+            page = ttk.Frame(content)
+            page.columnconfigure(0, weight=1)
+            self.pages[key] = page
+
+        # ==== Remote page ====
+        page = self.pages["remote"]
+        cards = ttk.Frame(page)
+        cards.grid(row=0, column=0, sticky="ew")
         cards.columnconfigure(0, weight=1, uniform="card")
         cards.columnconfigure(1, weight=1, uniform="card")
 
-        share = card(cards, "Allow remote control", row=0, column=0, sticky="nsew", padx=(0, 8))
-        ttk.Label(share, text="Give this ID and password to the person who will connect.",
-                  style="Muted.TLabel", wraplength=420).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 10))
+        share = card(cards, "Allow remote control", "Give this ID and password to the person who will connect.",
+                     row=0, column=0, sticky="nsew", padx=(0, 10))
         ttk.Label(share, text="Your ID", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
         self.id_entry = ttk.Entry(share, textvariable=self.my_id, font=(theme.FONT, 18, "bold"), width=14)
         self.id_entry.grid(row=3, column=0, sticky="ew")
-        ttk.Button(share, text="Copy", width=6, command=lambda: self.id_ready and self.copy(self.my_id.get())
-                   ).grid(row=3, column=1, padx=(6, 0))
-        self.new_id_btn = ttk.Button(share, text="New", width=5, command=self.new_number)
-        self.new_id_btn.grid(row=3, column=2, padx=(4, 0))
-        ttk.Label(share, text="Password", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        size = round(36 * root.winfo_fpixels("1i") / 96)  # one size for every icon button
+        icon_btn(share, "\uE8C8", lambda: self.id_ready and self.copy(self.my_id.get()), "Copy ID", size,
+                 flash=True).grid(row=3, column=1, padx=(8, 0))
+        self.new_id_btn = icon_btn(share, "\uE72C", self.new_number, "New ID", size)
+        self.new_id_btn.grid(row=3, column=2, padx=(6, 0))
+        ttk.Label(share, text="Password", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(12, 0))
         self.pw_entry = ttk.Entry(share, textvariable=self.password, show="•", font=(theme.FONT, 14), width=14)
         self.pw_entry.grid(row=5, column=0, sticky="ew")
-        ttk.Button(share, text="Copy", width=6, command=lambda: self.copy(self.password.get())
-                   ).grid(row=5, column=1, padx=(6, 0))
-        self.new_btn = ttk.Button(share, text="New", width=5, command=self.new_password)
-        self.new_btn.grid(row=5, column=2, padx=(4, 0))
+        icon_btn(share, "\uE8C8", lambda: self.copy(self.password.get()), "Copy password", size,
+                 flash=True).grid(row=5, column=1, padx=(8, 0))
+        self.new_btn = icon_btn(share, "\uE72C", self.new_password, "New password", size)
+        self.new_btn.grid(row=5, column=2, padx=(6, 0))
         ttk.Checkbutton(share, text="Show ID and password", variable=self.show_pw, command=self.toggle_show,
-                        style="Card.TCheckbutton").grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        self.toggle_btn = accent(share, "Start sharing", "green", self.toggle)
-        self.toggle_btn.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+                        style="Card.TCheckbutton").grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.toggle_btn = accent(share, "Start sharing", "accent", self.toggle)
+        self.toggle_btn.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(14, 0))
 
-        ctrl = card(cards, "Control a remote computer", row=0, column=1, sticky="nsew", padx=(8, 0))
-        ttk.Label(ctrl, text="Enter the ID and password shown on the other computer.",
-                  style="Muted.TLabel", wraplength=420).grid(row=1, column=0, sticky="w", pady=(2, 10))
+        ctrl = card(cards, "Control a remote computer", "Enter the ID and password shown on the other computer.",
+                    row=0, column=1, sticky="nsew", padx=(10, 0))
         ttk.Label(ctrl, text="Partner ID", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
         partner_entry = ttk.Entry(ctrl, textvariable=self.partner, font=(theme.FONT, 18))
         partner_entry.grid(row=3, column=0, sticky="ew")
-        ttk.Label(ctrl, text="Password", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(ctrl, text="Password", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(12, 0))
         partner_pw_entry = ttk.Entry(ctrl, textvariable=self.partner_pw, show="•", font=(theme.FONT, 14))
         partner_pw_entry.grid(row=5, column=0, sticky="ew")
         for entry in (partner_entry, partner_pw_entry):
             entry.bind("<Return>", lambda _e: self.connect_partner())
-        self.partner_msg = ttk.Label(ctrl, text="", style="Error.TLabel", wraplength=340)
-        self.partner_msg.grid(row=6, column=0, sticky="w", pady=(8, 0))
+        self.partner_msg = ttk.Label(ctrl, text="", style="Error.TLabel", wraplength=420)
+        self.partner_msg.grid(row=6, column=0, sticky="w", pady=(10, 0))
         ctrl.rowconfigure(6, weight=1)
-        self.connect_btn = accent(ctrl, "Connect", "accent", self.connect_partner)
-        self.connect_btn.grid(row=7, column=0, sticky="ew", pady=(12, 0))
+        self.connect_btn = accent(ctrl, "Connect", "indigo", self.connect_partner)
+        self.connect_btn.grid(row=7, column=0, sticky="ew", pady=(14, 0))
 
-        # ---- browser access: open one of these on the other computer, no app needed ----
-        links = card(main, None, row=2, column=0, sticky="ew", pady=(12, 0))
+        links = card(page, "Browser access", row=1, column=0, sticky="ew", pady=(16, 0))
+        links.columnconfigure(0, weight=0)
         links.columnconfigure(1, weight=1)
-        ttk.Label(links, text="Browser access", style="Head.TLabel"
-                  ).grid(row=0, column=0, sticky="w")
-        ttk.Label(links, text="Open one of these in any browser on the other computer (no app needed).",
-                  style="Muted.TLabel").grid(row=0, column=1, columnspan=2, sticky="w", padx=(10, 0))
-        for i, (key, label) in enumerate((("local", "This PC"), ("lan", "Same network"), ("net", "Internet")), 1):
-            ttk.Label(links, text=label, style="Card.TLabel").grid(row=i, column=0, sticky="w", padx=(0, 10), pady=(4, 0))
+        ttk.Label(links, text="Open one of these in a browser on the other computer, no app needed.",
+                  style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 4))
+        for i, (key, label) in enumerate((("local", "This PC"), ("lan", "Same network"), ("net", "Internet")), 2):
+            ttk.Label(links, text=label, style="Card.TLabel").grid(row=i, column=0, sticky="w", padx=(0, 14), pady=(4, 0))
             self.addr_entries[key] = ttk.Entry(links, textvariable=self.addr[key], state="readonly")
             self.addr_entries[key].grid(row=i, column=1, sticky="ew", pady=(4, 0))
-            ttk.Button(links, text="Copy", width=6, command=lambda k=key: self.copy(self.addr[k].get(), url=True)
-                       ).grid(row=i, column=2, padx=(6, 0), pady=(4, 0))
+            icon_btn(links, "\uE8C8", lambda k=key: self.copy(self.addr[k].get(), url=True), "Copy link",
+                     size, flash=True).grid(row=i, column=2, padx=(8, 0), pady=(4, 0))
 
-        # ---- connected devices and activity ----
-        bottom = card(main, None, row=3, column=0, sticky="nsew", pady=(12, 0))
-        main.rowconfigure(3, weight=1)
-        bottom.columnconfigure(0, weight=2)
-        bottom.columnconfigure(1, weight=3)
-        bottom.rowconfigure(1, weight=1)
-        ttk.Label(bottom, text="Connected devices", style="Head.TLabel"
-                  ).grid(row=0, column=0, sticky="w")
-        ttk.Label(bottom, text="Activity", style="Head.TLabel"
-                  ).grid(row=0, column=1, sticky="w", padx=(16, 0))
-        devices = ttk.Frame(bottom, style="Card.TFrame")
-        devices.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        # ==== Devices page ====
+        page = self.pages["devices"]
+        page.rowconfigure(1, weight=1)
+        devices = card(page, "Connected devices", "Everyone connected to this computer right now.",
+                       row=0, column=0, sticky="ew")
         devices.columnconfigure(0, weight=1)
-        self.tree = ttk.Treeview(devices, columns=("ip", "since"), show="headings", height=2, selectmode="none")
+        self.tree = ttk.Treeview(devices, columns=("ip", "since"), show="headings", height=4, selectmode="none")
         self.tree.heading("ip", text="Address", anchor="w")
-        self.tree.heading("since", text="Since", anchor="w")
-        self.tree.column("ip", width=140, anchor="w")
-        self.tree.column("since", width=70, anchor="w")
-        self.tree.grid(row=0, column=0, columnspan=2, sticky="ew")
-        self.kick_btn = ttk.Button(devices, text="Disconnect all", command=self.disconnect_all)
-        self.kick_btn.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Button(devices, text="Received files", command=self.open_received
-                   ).grid(row=1, column=1, sticky="e", pady=(6, 0))
-        logwrap = ttk.Frame(bottom, style="Card.TFrame")
-        logwrap.grid(row=1, column=1, sticky="nsew", padx=(16, 0), pady=(6, 0))
-        logwrap.columnconfigure(0, weight=1)
-        logwrap.rowconfigure(0, weight=1)
-        self.logbox = th.paint(tk.Text(logwrap, height=4, width=30, state="disabled", wrap="word", relief="flat",
-                                       font=(theme.MONO, 9), padx=8, pady=6, highlightthickness=1, bd=0),
+        self.tree.heading("since", text="Connected since", anchor="w")
+        self.tree.column("ip", width=260, anchor="w")
+        self.tree.column("since", width=140, anchor="w")
+        self.tree.grid(row=2, column=0, columnspan=3, sticky="ew")
+        buttons = tk.Frame(devices, bd=0)
+        th.paint(buttons, bg="card")
+        buttons.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        self.kick_btn = ttk.Button(buttons, text="Disconnect all", command=self.disconnect_all)
+        self.kick_btn.pack(side="left")
+        ttk.Button(buttons, text="Open received files", command=self.open_received).pack(side="left", padx=(8, 0))
+
+        activity_card = ui.RoundCard(page, th)
+        activity_card.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
+        activity = activity_card.body
+        activity.columnconfigure(0, weight=1)
+        ttk.Label(activity, text="Activity", style="Title.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
+        self.logbox = th.paint(tk.Text(activity, height=12, width=30, state="disabled", wrap="word", relief="flat",
+                                       font=(theme.MONO, 9), padx=10, pady=8, highlightthickness=1, bd=0),
                                bg="log", fg="text", highlightbackground="border", highlightcolor="border",
                                insertbackground="text")
-        scroll = ttk.Scrollbar(logwrap, command=self.logbox.yview)
+        scroll = ttk.Scrollbar(activity, command=self.logbox.yview)
         self.logbox.configure(yscrollcommand=scroll.set)
-        self.logbox.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
+        self.logbox.grid(row=1, column=0, sticky="nsew")
+        scroll.grid(row=1, column=1, sticky="ns")
 
-        # ---- settings: a separate window, opened from the header ----
-        ttk.Button(head, text="Settings", width=9, command=self.toggle_settings).grid(row=0, column=6, padx=(8, 0))
-        win = tk.Toplevel(root)
-        win.withdraw()
-        win.title("Settings - Remote Desktop")
-        self.theme.window(win)
-        win.resizable(False, False)
-        win.protocol("WM_DELETE_WINDOW", win.withdraw)
-        self.settings_win = win
-        outer = ttk.Frame(win, padding=14)
-        outer.pack(fill="both", expand=True)
-        outer.columnconfigure(0, weight=1)
-        sets = card(outer, "Settings", row=0, column=0, sticky="nsew")
-        body = ttk.Frame(sets, style="Card.TFrame")  # below the title
-        body.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        sets = body
-        sets.columnconfigure(1, weight=1)
-        self.control_chk = ttk.Checkbutton(sets, text="Allow mouse and keyboard control",
-                                           variable=self.control, style="Card.TCheckbutton")
-        self.control_chk.grid(row=0, column=0, sticky="w")
-        self.internet_chk = ttk.Checkbutton(sets, text="Allow connections from the internet",
-                                            variable=self.internet, style="Card.TCheckbutton")
-        self.internet_chk.grid(row=0, column=1, sticky="w", padx=(24, 0))
-        port = ttk.Frame(sets, style="Card.TFrame")
-        port.grid(row=0, column=2, sticky="e", padx=(16, 0))
-        ttk.Label(port, text="Port", style="Card.TLabel").pack(side="left", padx=(0, 6))
-        self.port_entry = ttk.Entry(port, textvariable=self.port, width=7)
-        self.port_entry.pack(side="left")
-        ttk.Checkbutton(sets, text="Start sharing when the app opens", variable=self.auto_share,
-                        command=self.save, style="Card.TCheckbutton").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(sets, text="Open the app when I sign in", variable=self.auto_launch,
-                        command=self.toggle_auto_launch, style="Card.TCheckbutton"
-                        ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(24, 0), pady=(6, 0))
-        row = 2
+        # ==== Settings page ====
+        page = self.pages["settings"]
+        cols = ttk.Frame(page)
+        cols.grid(row=0, column=0, sticky="ew")
+        cols.columnconfigure(0, weight=1, uniform="set")
+        cols.columnconfigure(1, weight=1, uniform="set")
+
+        sharing = card(cols, "Sharing", row=0, column=0, sticky="nsew", padx=(0, 10))
+        self.control_chk = toggle_row(sharing, 1, "Mouse and keyboard control",
+                                      "Let the other person use this computer", self.control)
+        self.internet_chk = toggle_row(sharing, 3, "Connections from the internet",
+                                       "Off: only computers on this network", self.internet)
+        ttk.Label(sharing, text="Port", style="Card.TLabel").grid(row=5, column=0, sticky="w", pady=(14, 0))
+        self.port_entry = ttk.Entry(sharing, textvariable=self.port, width=8, justify="center")
+        self.port_entry.grid(row=5, column=1, sticky="e", pady=(14, 0))
+        ttk.Label(sharing, text="Change these while not sharing.", style="Muted.TLabel"
+                  ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        startup = card(cols, "Startup", row=0, column=1, sticky="nsew", padx=(10, 0))
+        toggle_row(startup, 1, "Open when I sign in", "Starts hidden in the tray", self.auto_launch,
+                   self.toggle_auto_launch)
+        toggle_row(startup, 3, "Start sharing when the app opens", "Ready for remote access right away",
+                   self.auto_share, self.save)
+
+        row = 1
         if WINDOWS:
-            admin = ttk.Frame(sets, style="Card.TFrame")
-            admin.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+            win = card(page, "Windows", row=row, column=0, sticky="ew", pady=(16, 0))
+            win.columnconfigure(0, weight=1)
             if is_admin():
-                ttk.Label(admin, text="Running as administrator: Task Manager and other administrator "
-                                      "windows can be controlled.", style="Good.TLabel"
-                          ).pack(side="left")
+                ttk.Label(win, text="Running as administrator: Task Manager and other administrator windows "
+                                    "can be controlled.", style="Good.TLabel").grid(row=1, column=0, sticky="w",
+                                                                                    pady=(8, 0))
             else:
-                ttk.Button(admin, text="Restart as administrator", command=self.restart_as_admin).pack(side="left")
-                ttk.Label(admin, text="Needed to control Task Manager and other administrator windows.",
-                          style="Muted.TLabel").pack(side="left", padx=(8, 0))
-            svc = ttk.Frame(sets, style="Card.TFrame")
-            svc.grid(row=row + 1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-            self.svc_btn = ttk.Button(svc, text="Install service", width=16, command=self.toggle_service)
-            self.svc_btn.pack(side="left")
-            self.svc_label = ttk.Label(svc, text="", style="Muted.TLabel", wraplength=620)
-            self.svc_label.pack(side="left", padx=(8, 0))
-            row += 2
-        upd = ttk.Frame(sets, style="Card.TFrame")
-        upd.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+                ttk.Label(win, text="Restart as administrator to control Task Manager and other administrator "
+                                    "windows.", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
+                ttk.Button(win, text="Restart as administrator", command=self.restart_as_admin
+                           ).grid(row=1, column=1, sticky="e", pady=(8, 0))
+            self.svc_label = ttk.Label(win, text="", style="Muted.TLabel", wraplength=520)
+            self.svc_label.grid(row=2, column=0, sticky="w", pady=(10, 0))
+            self.svc_btn = ttk.Button(win, text="Install service", width=16, command=self.toggle_service)
+            self.svc_btn.grid(row=2, column=1, sticky="e", pady=(10, 0))
+            row += 1
+
+        upd = card(page, "Updates", row=row, column=0, sticky="ew", pady=(16, 0))
+        upd.columnconfigure(0, weight=0)
         upd.columnconfigure(1, weight=1)
-        ttk.Label(upd, text="Updates from GitHub", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(upd, text="GitHub repository", style="Card.TLabel").grid(row=1, column=0, sticky="w",
+                                                                        padx=(0, 14), pady=(10, 0))
         repo_entry = ttk.Entry(upd, textvariable=self.update_repo)
-        repo_entry.grid(row=0, column=1, sticky="ew")
+        repo_entry.grid(row=1, column=1, sticky="ew", pady=(10, 0))
         repo_entry.bind("<Return>", lambda _e: self.set_update_repo(self.update_repo.get()))
         ttk.Button(upd, text="Save", width=6, command=lambda: self.set_update_repo(self.update_repo.get())
-                   ).grid(row=0, column=2, padx=(6, 0))
-        ttk.Label(upd, text="The repository whose Releases hold the installers, e.g. myname/remote-desktop.",
-                  style="Muted.TLabel").grid(row=1, column=1, columnspan=2, sticky="w", pady=(2, 0))
-        ttk.Button(outer, text="Close", width=10, command=win.withdraw).grid(row=1, column=0, sticky="e", pady=(10, 0))
+                   ).grid(row=1, column=2, padx=(6, 0), pady=(10, 0))
+        self.update_btn = accent(upd, "Check for updates", "accent", lambda: self.check_updates(manual=True))
+        self.update_btn.configure(font=(theme.FONT, 10, "bold"), pady=5)
+        self.update_btn.grid(row=1, column=3, padx=(10, 0), pady=(10, 0))
+
+        self.show_page("remote")
+
+    def show_page(self, key):
+        for name, page in self.pages.items():
+            if name == key:
+                page.grid(row=1, column=0, sticky="nsew")
+            else:
+                page.grid_remove()
+        self.page_title.configure(text={"remote": "Remote control", "devices": "Devices",
+                                        "settings": "Settings"}[key])
+        self.sidebar.select(key)
 
     def toggle_settings(self):
-        """Open the Settings window next to the main window."""
-        win = self.settings_win
-        win.transient(self.root)
-        win.geometry(f"+{self.root.winfo_rootx() + 40}+{self.root.winfo_rooty() + 40}")
-        win.deiconify()
-        win.lift()
-        win.focus_force()
+        self.show_window()
+        self.show_page("settings")
 
     # ---- small actions ----
     def toggle_show(self):
@@ -917,28 +942,17 @@ class App:
     def on_update_info(self, manual, info, error):
         self.update_busy = False
         self.update_btn.configure(state="normal")
-        if info == "none":  # the repository has no release yet: nothing to update to
-            self.last_update_check = time.time()
-            self.save()
-            self.update_label.configure(text=f"Version {VERSION} - no releases published yet")
-            if manual:
-                messagebox.showinfo("Updates", f"You have version {VERSION}.\n\n{error}\n\n"
-                                               "Publish one on GitHub (Releases > Draft a new release) "
-                                               "with RemoteDesktopSetup.exe attached.")
-            return
-        if error:
-            self.update_label.configure(text=f"Version {VERSION} - could not check for updates")
-            if manual:
-                messagebox.showwarning("Updates", f"Could not check for updates:\n{error}")
+        # Only the version and whether it is up to date are shown; no dialog unless there is an update.
+        if error and info != "none":
+            self.update_label.configure(text=f"Version {VERSION} · couldn't check")
+            self.note(f"Could not check for updates: {error}")
             return
         self.last_update_check = time.time()
         self.save()
-        if not info:
-            self.update_label.configure(text=f"Version {VERSION} - up to date")
-            if manual:
-                messagebox.showinfo("Updates", f"You have the latest version ({VERSION}).")
+        if not info or info == "none":  # no newer release (or none published yet)
+            self.update_label.configure(text=f"Version {VERSION} · Up to date")
             return
-        self.update_label.configure(text=f"Version {VERSION} - version {info['version']} is available")
+        self.update_label.configure(text=f"Version {VERSION} · {info['version']} available")
         self.note(f"Version {info['version']} is available.")
         if not manual and not self.root.winfo_viewable():  # running hidden: don't pop up a dialog
             self.tray.notify(f"Version {info['version']} is available. Open Remote Desktop to update.")
@@ -1203,7 +1217,7 @@ class App:
         pal = self.theme.pal
         self.dot.itemconfigure(self.dot_id, fill=pal["green"] if running else pal["grey"] if self.state == "stopped"
                                else pal["amber"])
-        self.theme.set_accent(self.toggle_btn, "red" if running else "green" if self.state == "stopped" else "amber")
+        self.theme.set_accent(self.toggle_btn, "red" if running else "accent" if self.state == "stopped" else "amber")
         self.toggle_btn.configure(text="Stop sharing" if running else label if self.state != "stopped"
                                   else "Start sharing",
                                   state="normal" if self.state in ("stopped", "running") else "disabled")
