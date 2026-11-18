@@ -21,8 +21,12 @@ three on GitHub's machines and offers them as downloads.
 ## Status
 
 - Windows: built and tested (install, run, uninstall).
-- Linux and macOS: the scripts and the input code (`input_pynput.py`) are written
-  but have not been run on those systems yet.
+- Linux (.deb, .tar.gz, x86-64) and macOS (.dmg, Apple Silicon): built by the GitHub
+  workflow. Each build launches the finished app with `--selftest` (screen capture,
+  mouse/keyboard backend, viewer page, icon, tunnel program, app window) and fails if
+  anything is missing. Not yet used on a real Linux desktop or Mac by a person.
+
+Run `RemoteDesktop --selftest` on any system to repeat those checks.
 
 ## Platform notes
 
