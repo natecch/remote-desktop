@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -77,8 +78,8 @@ def check():
         with _open(f"https://api.github.com/repos/{SOURCE}/releases/latest") as response:
             data = json.load(response)
     except urllib.error.HTTPError as exc:
-        if exc.code != 404:
-            raise OSError(f"GitHub answered {exc.code} {exc.reason}.") from None
+        if exc.code != 404:  # e.g. 403/429: GitHub's API allows 60 requests an hour per address
+            return _check_without_api()
         # 404 means either no such (public) repository, or one without any release yet.
         try:
             _open(f"https://api.github.com/repos/{SOURCE}").close()
@@ -86,13 +87,45 @@ def check():
             raise OSError(f"github.com/{SOURCE} was not found. Check the name in Settings "
                           "(the repository must be public).") from None
         raise NoReleases(f"github.com/{SOURCE} has no releases yet, so there is nothing to update to.") from None
-    except ValueError as exc:
-        raise OSError(f"Unexpected reply from GitHub: {exc}") from None
+    except (ValueError, urllib.error.URLError, OSError):
+        return _check_without_api()
     tag = str(data.get("tag_name", ""))
     if parse(tag) <= parse(VERSION):
         return None
     return {"version": tag.lstrip("vV"), "page": data.get("html_url") or f"https://github.com/{SOURCE}/releases",
             "asset": _pick(data.get("assets") or []), "assets": data.get("assets") or []}
+
+
+def _asset_names(version):
+    """The file names the release workflow gives each system's installer."""
+    if WINDOWS:
+        return "RemoteDesktopSetup.exe", "SHA256SUMS-windows.txt"
+    if MAC:
+        return f"RemoteDesktop-{version}-arm64.dmg", "SHA256SUMS-macos.txt"
+    suffix = ".deb" if shutil.which("dpkg") else ".tar.gz"
+    return f"remote-desktop_{version}_amd64{suffix}", "SHA256SUMS-linux.txt"
+
+
+def _check_without_api():
+    """The same check through github.com's ordinary pages, which have no hourly limit:
+    /releases/latest redirects to the newest release's tag."""
+    try:
+        with _open(f"https://github.com/{SOURCE}/releases/latest") as response:
+            final = response.geturl()
+    except urllib.error.HTTPError as exc:
+        raise OSError(f"GitHub answered {exc.code} {exc.reason}.") from None
+    match = re.search(r"/releases/tag/([^/?#]+)$", final)
+    if not match:  # stayed on /releases: there is no release yet
+        raise NoReleases(f"github.com/{SOURCE} has no releases yet, so there is nothing to update to.")
+    tag = urllib.parse.unquote(match.group(1))
+    if parse(tag) <= parse(VERSION):
+        return None
+    version = tag.lstrip("vV")
+    base = f"https://github.com/{SOURCE}/releases/download/{urllib.parse.quote(tag)}/"
+    name, sums = _asset_names(version)
+    return {"version": version, "page": final,
+            "asset": {"name": name, "browser_download_url": base + name, "size": 0},
+            "assets": [{"name": sums, "browser_download_url": base + sums}]}
 
 
 def _expected_sha256(info):
@@ -151,8 +184,8 @@ def download(info, progress=None):
     url = str(asset.get("browser_download_url", ""))
     if not url.startswith("https://github.com/"):
         raise OSError("The installer is not hosted on GitHub.")
-    size = int(asset.get("size") or 0)
-    if not 0 < size <= MAX_SIZE:
+    size = int(asset.get("size") or 0)  # 0: not known in advance (checked as it downloads)
+    if size < 0 or size > MAX_SIZE:
         raise OSError("The installer has an unexpected size.")
     expected = _expected_sha256(info)
     if not expected:
@@ -163,13 +196,13 @@ def download(info, progress=None):
         with _open(url, timeout=60) as response, open(target, "wb") as out:
             while chunk := response.read(1 << 16):
                 got += len(chunk)
-                if got > size:
+                if got > (size or MAX_SIZE):
                     raise OSError("The download is larger than announced.")
                 digest.update(chunk)
                 out.write(chunk)
                 if progress:
-                    progress(got, size)
-        if got != size or digest.hexdigest() != expected:
+                    progress(got, size or got)
+        if (size and got != size) or digest.hexdigest() != expected:
             raise OSError("The download is damaged or was changed (checksum mismatch).")
         if WINDOWS and getattr(sys, "frozen", False):
             mine = _signature(sys.executable)

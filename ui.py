@@ -264,7 +264,7 @@ class Tooltip:
 class Sidebar(tk.Canvas):
     """The coloured navigation column: logo, page buttons, and a line at the bottom."""
 
-    def __init__(self, parent, theme, title, logo_path, width=168):
+    def __init__(self, parent, theme, title, logo_path, width=180):
         self.s = parent.winfo_fpixels("1i") / 96  # display scaling: fonts grow with it, so must layout
         super().__init__(parent, width=round(width * self.s), highlightthickness=0, bd=0)
         self.theme, self.title, self.items, self.selected = theme, title, [], None
@@ -359,8 +359,13 @@ class Sidebar(tk.Canvas):
         s = self.s
         if self.logo:
             self.create_image(round(16 * s), round(24 * s), image=self.logo, anchor="nw")
+        # The name must fit beside the logo at any display scaling: shrink the font until it does.
+        room = w - round(52 * s) - round(12 * s)
+        size = 11
+        while size > 8 and tkfont.Font(family="Segoe UI", size=size, weight="bold").measure(self.title) > room:
+            size -= 1
         self.create_text(round(52 * s), round(38 * s), text=self.title, anchor="w", fill="#ffffff",
-                         font=("Segoe UI", 11, "bold"))
+                         font=("Segoe UI", size, "bold"))
         for i, item in enumerate(self.items):
             top, ih = self.item_top + i * self.item_h, self.item_h
             chosen, hot = item["key"] == self.selected, item["key"] == self.hovered

@@ -25,7 +25,7 @@ import tkinter as tk
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import messagebox, ttk
 
 import autostart
 import host
@@ -412,7 +412,10 @@ class App:
         self.number = saved_id if rendezvous.is_id(saved_id) else rendezvous.new_id()
         self.registered = None      # None = not yet known, True/False = number lookup works or not
         self.last_publish = 0.0
-        self.auto_share = tk.BooleanVar(value=bool(saved.get("auto_share", False)))
+        # Start sharing when the app opens: on by default (switched on once for existing settings too).
+        self.auto_share = tk.BooleanVar(value=bool(saved.get("auto_share", True))
+                                        or not saved.get("auto_share_default_done", False))
+        self.auto_share_default_done = True
         # Opening at sign-in is on by default; once applied, the user's own choice is kept.
         self.launch_default_pending = not saved.get("launch_default_done", False)
         self.auto_launch = tk.BooleanVar(value=autostart.is_enabled() or self.launch_default_pending)
@@ -425,9 +428,11 @@ class App:
         self.uac_restored = bool(saved.get("uac_restored", False))
         self.last_update_check = float(saved.get("last_update_check", 0))
         self.update_busy = False
-        self.update_repo = tk.StringVar(value=str(saved.get("update_repo") or updater.REPO or ""))
-        if updater.normalize(self.update_repo.get()):
-            updater.SOURCE = updater.normalize(self.update_repo.get())
+        self.auto_update = tk.BooleanVar(value=bool(saved.get("auto_update", True)))
+        self.update_auto_run = False   # the update in progress was started automatically
+        self.pending_update = None     # found automatically while someone was connected: install later
+        # Sharing was on when an automatic update restarted the app: carry on sharing.
+        self.resume_share = bool(saved.get("resume_share", False))
 
         root.title(f"Remote Desktop {VERSION}")
         try:  # window and taskbar icon; on Windows the .ico has crisp small sizes
@@ -453,7 +458,7 @@ class App:
             self.tray.start()
             self.instance.start()
             root.after(1500, self.apply_autostart)
-            root.after(5000, lambda: self.check_updates(manual=False))
+            root.after(5000, self.update_timer)
             threading.Thread(target=updater.cleanup, daemon=True).start()
         self.refresh_service()
         self.refresh()
@@ -464,7 +469,8 @@ class App:
                 root.iconify()
         if "--share" in sys.argv:  # restarted as administrator while sharing: wait for the old copy to exit
             root.after(2500, lambda: self.start(quiet=True))
-        elif self.auto_share.get():
+        elif self.auto_share.get() or self.resume_share:  # resume_share: sharing before an update
+            self.resume_share = False
             root.after(600, lambda: self.start(quiet=True))
         root.after(150, self.poll)
         root.after(1000, self.tick)
@@ -670,18 +676,11 @@ class App:
             row += 1
 
         upd = card(page, "Updates", row=row, column=0, sticky="ew", pady=(16, 0))
-        upd.columnconfigure(0, weight=0)
-        upd.columnconfigure(1, weight=1)
-        ttk.Label(upd, text="GitHub repository", style="Card.TLabel").grid(row=1, column=0, sticky="w",
-                                                                        padx=(0, 14), pady=(10, 0))
-        repo_entry = ttk.Entry(upd, textvariable=self.update_repo)
-        repo_entry.grid(row=1, column=1, sticky="ew", pady=(10, 0))
-        repo_entry.bind("<Return>", lambda _e: self.set_update_repo(self.update_repo.get()))
-        ttk.Button(upd, text="Save", width=6, command=lambda: self.set_update_repo(self.update_repo.get())
-                   ).grid(row=1, column=2, padx=(6, 0), pady=(10, 0))
+        toggle_row(upd, 1, "Install updates automatically",
+                   "New versions install by themselves when no one is connected", self.auto_update, self.save)
         self.update_btn = accent(upd, "Check for updates", "accent", lambda: self.check_updates(manual=True))
         self.update_btn.configure(font=(theme.FONT, 10, "bold"), pady=5)
-        self.update_btn.grid(row=1, column=3, padx=(10, 0), pady=(10, 0))
+        self.update_btn.grid(row=3, column=0, columnspan=2, sticky="w", pady=(14, 0))
 
         self.show_page("remote")
 
@@ -803,7 +802,9 @@ class App:
                           auto_share=self.auto_share.get(),
                           uac_restored=self.uac_restored,
                           last_update_check=self.last_update_check,
-                          update_repo=self.update_repo.get().strip(),
+                          auto_update=self.auto_update.get(),
+                          auto_share_default_done=self.auto_share_default_done,
+                          resume_share=self.resume_share,
                           launch_default_done=not self.launch_default_pending)
         except OSError as exc:
             self.note(f"Could not save settings: {exc}")
@@ -897,35 +898,22 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     # ---- updates (GitHub Releases) ----
-    def set_update_repo(self, text):
-        """Use the GitHub repository the user entered for updates. False if it is not one."""
-        repo = updater.normalize(text)
-        if not repo:
-            messagebox.showwarning("Updates", "That is not a GitHub repository. Use owner/name, "
-                                              "for example myname/remote-desktop.")
-            return False
-        self.update_repo.set(repo)
-        updater.SOURCE = repo
-        self.last_update_check = 0.0
-        self.save()
-        self.note(f"Updates will come from github.com/{repo}.")
-        return True
+    AUTO_CHECK_HOURS = 6
+
+    def update_timer(self):
+        """Look for updates now and then while the app runs (it may run for weeks in the tray)."""
+        if self.pending_update and not host.SESSIONS and not self.update_busy:
+            info, self.pending_update = self.pending_update, None
+            self.start_update(info, auto=True)  # the person who was connected has left
+        else:
+            self.check_updates(manual=False)
+        self.root.after(10 * 60 * 1000, self.update_timer)
 
     def check_updates(self, manual):
-        if self.update_busy:
+        if self.update_busy or not updater.configured():
             return
-        if not updater.configured():
-            if not manual:
-                return
-            text = simpledialog.askstring(
-                "Where do updates come from?",
-                "Updates are downloaded from a GitHub repository's Releases.\n"
-                "Enter the repository (owner/name or its github.com link):",
-                initialvalue=self.update_repo.get(), parent=self.root)
-            if text is None or not self.set_update_repo(text):
-                return
-        if not manual and time.time() - self.last_update_check < 20 * 3600:
-            return  # automatic checks at most about once a day
+        if not manual and time.time() - self.last_update_check < self.AUTO_CHECK_HOURS * 3600:
+            return
         self.update_busy = True
         self.update_btn.configure(state="disabled")
         self.update_label.configure(text="Checking for updates…")
@@ -944,7 +932,7 @@ class App:
         self.update_btn.configure(state="normal")
         # Only the version and whether it is up to date are shown; no dialog unless there is an update.
         if error and info != "none":
-            self.update_label.configure(text=f"Version {VERSION} · couldn't check")
+            self.update_label.configure(text=f"Version {VERSION}")  # the reason goes to Activity
             self.note(f"Could not check for updates: {error}")
             return
         self.last_update_check = time.time()
@@ -954,6 +942,13 @@ class App:
             return
         self.update_label.configure(text=f"Version {VERSION} · {info['version']} available")
         self.note(f"Version {info['version']} is available.")
+        if not manual and self.auto_update.get() and info["asset"] and WINDOWS:
+            if host.SESSIONS:  # never restart under someone's remote session: wait until they leave
+                self.pending_update = info
+                self.note(f"Version {info['version']} will install once no one is connected.")
+            else:
+                self.start_update(info, auto=True)
+            return
         if not manual and not self.root.winfo_viewable():  # running hidden: don't pop up a dialog
             self.tray.notify(f"Version {info['version']} is available. Open Remote Desktop to update.")
             return
@@ -968,6 +963,13 @@ class App:
                 f"Version {info['version']} is available (you have {VERSION}).\n\n"
                 f"Download and install it now?{busy}"):
             return
+        self.start_update(info, auto=False)
+
+    def start_update(self, info, auto):
+        """Download, verify and install `info` (from updater.check)."""
+        self.update_auto_run = auto
+        if auto:
+            self.note(f"Updating to version {info['version']} automatically.")
         self.update_busy = True
         self.update_btn.configure(state="disabled")
         self.update_label.configure(text=f"Downloading version {info['version']}…")
@@ -986,8 +988,10 @@ class App:
         self.update_busy = False
         self.update_btn.configure(state="normal")
         if error:
-            self.update_label.configure(text=f"Version {VERSION} - update failed")
-            messagebox.showwarning("Update failed", error)
+            self.update_label.configure(text=f"Version {VERSION} · update failed")
+            self.note(f"Update failed: {error}")
+            if not self.update_auto_run:
+                messagebox.showwarning("Update failed", error)
             return
         if not WINDOWS:
             self.update_label.configure(text=f"Downloaded {path.name}")
@@ -1000,6 +1004,9 @@ class App:
             messagebox.showwarning("Update failed", str(exc))
             return
         self.note("Installing the update; Remote Desktop will start again by itself.")
+        if self.update_auto_run:
+            self.tray.notify("Updating Remote Desktop. It will start again in a moment.")
+        self.resume_share = self.state == "running"  # the new version carries on sharing
         self.on_close(force=True)
 
     def toggle_auto_launch(self):
