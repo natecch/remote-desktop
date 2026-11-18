@@ -37,4 +37,6 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "RemoteDesktop"; ValueType: none; Flags: dontcreatekey uninsdeletevalue
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "Open {#AppName}"; Flags: nowait postinstall skipifsilent
+; The app's manifest requires administrator. A plain CreateProcess from this non-elevated
+; installer fails with error 740, so launch through the shell, which shows the UAC prompt.
+Filename: "{app}\{#AppExe}"; Description: "Open {#AppName}"; Flags: nowait postinstall skipifsilent shellexec
