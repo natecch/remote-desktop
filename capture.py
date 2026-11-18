@@ -47,6 +47,18 @@ class Grabber:
         self.cameras = {}   # monitor index -> dxcam camera, or the time to retry after
         self.latest = {}    # monitor index -> (version, BGRA array)
 
+    def reset(self):
+        """Drop capture handles after the thread moved to another desktop (secure desktop,
+        lock screen). Versions keep counting, so viewers still see the next change."""
+        for cam in self.cameras.values():
+            if cam is not None and not isinstance(cam, float):
+                try:
+                    cam.release()
+                except Exception:
+                    pass
+        self.cameras.clear()
+        self.sct = None
+
     def _mss(self):
         if self.sct is None:
             self.sct = mss.MSS() if hasattr(mss, "MSS") else mss.mss()

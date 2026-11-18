@@ -39,8 +39,11 @@ HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # also r
 # Mouse/keyboard injection and cursor lookup differ per operating system.
 if sys.platform == "win32":
     import input_win as inp
+    import agent_client  # the SYSTEM agent, for UAC prompts and the lock screen (winagent.py)
+    import drop_target   # which folder a dropped file lands in
 else:
     import input_pynput as inp
+    agent_client = drop_target = None
 
 # --------------------------------------------------------------------------
 # Screen capture (all capture happens on one dedicated thread)
@@ -58,7 +61,32 @@ def _screen():
 
 
 def list_monitors():
+    if agent_client and agent_client.available():
+        try:
+            return agent_client.monitors()
+        except OSError:
+            agent_client.mark_down()
     return _screen().monitors()
+
+
+def grab_any(index, monitor, scale, quality, previous, previous_version, earliest=0.0, latest=0.0):
+    """grab_update through the agent when it is running (it can see the secure desktop),
+    otherwise here. A stream that loses the agent carries on locally from a full picture."""
+    if agent_client and (isinstance(previous, agent_client.View)
+                         or (previous is None and agent_client.available())):
+        try:
+            return agent_client.grab(index, monitor, scale, quality, previous, previous_version,
+                                     earliest, latest)
+        except OSError:
+            agent_client.mark_down()
+            previous, previous_version = None, -1
+    return grab_update(index, monitor, scale, quality, previous, previous_version, earliest, latest)
+
+
+def is_fast(index, frame):
+    if agent_client and isinstance(frame, agent_client.View):
+        return frame.fast
+    return _screen().fast(index)
 
 
 CAPTURE_TIMEOUT = 5.0  # normal capture calls take milliseconds
@@ -183,6 +211,7 @@ class Session:
         self.capture_error = False  # so a repeating capture error is logged once
         self.upload = None   # file currently being received from the viewer
         self.download = None  # task sending a file to the viewer
+        self.io = inp         # mouse/keyboard/pointer: here, or through the agent
 
 
 async def authenticate(ws, ip):
@@ -214,13 +243,13 @@ async def stream(ws, st, monitors):
     earliest = 0.0  # when the next screen update may be sent (time.perf_counter)
     while True:
         started = loop.time()
-        fast = _screen().fast(st.monitor)
+        fast = is_fast(st.monitor, st.frame)
         if st.wake.is_set():  # input or an acknowledgement arrived
             st.wake.clear()
         if st.pending < MAX_IN_FLIGHT:
             try:
                 st.frame, st.version, update, captured_at = await capture_call(
-                    grab_update, st.monitor, monitors[st.monitor], st.scale, st.quality,
+                    grab_any, st.monitor, monitors[st.monitor], st.scale, st.quality,
                     st.frame, st.version, earliest, time.perf_counter() + POLL_WINDOW)
             except CaptureStuck:
                 continue  # the capture thread was replaced; carry on with the new one
@@ -256,7 +285,8 @@ async def stream(ws, st, monitors):
                 if text and text != st.clip_text and len(text) <= MAX_CLIP:
                     st.clip_text = text
                     await ws.send(json.dumps({"t": "clip", "s": text}))
-        cursor = inp.cursor_info()  # the picture has no pointer in it, so report it separately
+        cursor = await asyncio.get_running_loop().run_in_executor(None, st.io.cursor_info) \
+            if st.io is not inp else inp.cursor_info()  # the picture has no pointer in it, so report it separately
         if cursor:
             mon = monitors[st.monitor]
             state = (round((cursor[0] - mon["left"]) / max(mon["width"] - 1, 1), 4),
@@ -270,23 +300,24 @@ async def stream(ws, st, monitors):
 def handle_input(st, monitors, msg):
     t = msg.get("t")
     mon = monitors[st.monitor]
+    io = st.io
     if t == "m":
-        inp.mouse_move(mon, msg["x"], msg["y"])
+        io.mouse_move(mon, float(msg["x"]), float(msg["y"]))
     elif t in ("d", "u"):
         button, down = int(msg["b"]), t == "d"
         if button not in inp.BUTTONS:
             return
-        inp.mouse_move(mon, msg["x"], msg["y"])
-        inp.mouse_button(button, down)
+        io.mouse_move(mon, float(msg["x"]), float(msg["y"]))
+        io.mouse_button(button, down)
         (st.buttons.add if down else st.buttons.discard)(button)
     elif t == "w":
-        inp.mouse_wheel(msg.get("dx", 0), msg.get("dy", 0))
+        io.mouse_wheel(float(msg.get("dx", 0)), float(msg.get("dy", 0)))
     elif t == "k":
         code, down = str(msg["c"]), bool(msg["down"])
-        if inp.key_event(code, down):
+        if io.key_event(code, down):
             (st.keys.add if down else st.keys.discard)(code)
     elif t == "text":
-        inp.type_text(str(msg["s"])[:20000])
+        io.type_text(str(msg["s"])[:20000])
     elif t == "clip":  # text copied on the viewer's computer, about to be pasted here
         text = str(msg["s"])[:MAX_CLIP]
         if text and inp.clipboard_set(text):
@@ -298,9 +329,9 @@ def handle_input(st, monitors, msg):
 
 def release_all(st):
     for code in list(st.keys):
-        inp.key_event(code, False)
+        st.io.key_event(code, False)
     for button in list(st.buttons):
-        inp.mouse_button(button, False)
+        st.io.mouse_button(button, False)
     st.keys.clear()
     st.buttons.clear()
 
@@ -390,8 +421,13 @@ def upload_start(st, msg):
     if shutil.disk_usage(RECEIVED_DIR).free < size + 200 * 1024 * 1024:
         raise OSError("Not enough free disk space on the remote computer")
     tmp = RECEIVED_DIR / f".{secrets.token_hex(6)}.part"
+    at = None  # where on the screen it was dropped (fractions of the shown monitor)
+    if "x" in msg and "y" in msg:
+        x, y = float(msg["x"]), float(msg["y"])
+        if 0 <= x <= 1 and 0 <= y <= 1:
+            at = (x, y)
     st.upload = {"id": msg["id"], "name": safe_name(msg["name"]), "size": size, "got": 0,
-                 "tmp": tmp, "f": open(tmp, "wb")}
+                 "tmp": tmp, "f": open(tmp, "wb"), "at": at}
 
 
 def upload_chunk(st, data):
@@ -413,6 +449,92 @@ def upload_finish(st):
     final = unique_path(RECEIVED_DIR, up["name"])
     up["tmp"].replace(final)
     return final
+
+
+async def place_dropped(st, final, at, monitors):
+    """Move a file dropped onto the remote screen into the folder under the pointer
+    (an Explorer window or the desktop). Returns (path, folder description or None)."""
+    if not (drop_target and at):
+        return final, None
+    loop = asyncio.get_running_loop()
+    mon = monitors[st.monitor]
+    px = mon["left"] + at[0] * (mon["width"] - 1)
+    py = mon["top"] + at[1] * (mon["height"] - 1)
+    try:
+        target = await loop.run_in_executor(None, drop_target.folder_at, px, py)
+    except Exception:
+        target = None
+    if not target:
+        return final, None
+    kind, value = target
+    if kind == "path":
+        if Path(value) == RECEIVED_DIR:
+            return final, None
+        try:
+            dest = unique_path(Path(value), final.name)
+            await loop.run_in_executor(None, shutil.move, str(final), str(dest))
+            return dest, str(value)
+        except OSError:
+            return final, None
+    # An Explorer window whose folder could not be read: paste the file into it (a move).
+    try:
+        ok = (await loop.run_in_executor(None, drop_target.put_files_on_clipboard, [final], True)
+              and await loop.run_in_executor(None, drop_target.activate, value))
+    except Exception:
+        ok = False
+    if not ok:
+        return final, None
+    st.clip_seq = inp.clipboard_seq()  # not something to copy to the viewer
+    for code, down in (("ControlLeft", True), ("KeyV", True), ("KeyV", False), ("ControlLeft", False)):
+        st.io.key_event(code, down)
+    return final, "the open folder"
+
+
+# Drag-out downloads: the Files panel lets the viewer drag a remote file onto its own
+# desktop. Browsers download such a drop from a plain URL, so each listed file gets an
+# unguessable link that works only while that viewer stays connected.
+LINKS = {}  # token -> {"path": str, "ws": websocket, "expires": float}
+LINK_MAX = 256 * 1024 * 1024
+LINK_SECONDS = 600
+
+
+def add_links(ws, listing):
+    now = time.monotonic()
+    for key in [k for k, v in LINKS.items() if v["expires"] < now]:
+        del LINKS[key]
+    for entry in listing["entries"]:
+        if not entry["d"] and entry.get("s", 0) <= LINK_MAX:
+            token = secrets.token_urlsafe(18)
+            LINKS[token] = {"path": entry["p"], "ws": ws, "expires": now + LINK_SECONDS}
+            entry["u"] = "/dl/" + token
+
+
+def drop_links(ws):
+    for key in [k for k, v in LINKS.items() if v["ws"] is ws]:
+        del LINKS[key]
+
+
+def _read_link(path):
+    target = Path(path)
+    size = target.stat().st_size
+    if not target.is_file() or size > LINK_MAX:
+        raise OSError("not available")
+    return target.name, target.read_bytes()
+
+
+async def serve_link(token):
+    link = LINKS.get(token)
+    if not link or link["expires"] < time.monotonic() or link["ws"] not in SESSIONS:
+        return http_response(404, "Not Found", b"This link has expired. Open the Files panel again.")
+    try:
+        name, body = await asyncio.get_running_loop().run_in_executor(None, _read_link, link["path"])
+    except OSError:
+        return http_response(404, "Not Found", b"File not available")
+    from urllib.parse import quote
+    response = http_response(200, "OK", body, "application/octet-stream")
+    response.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(name)}"
+    log(f"{SESSIONS[link['ws']]['ip']}: took a copy of {link['path']} ({fmt_size(len(body))})")
+    return response
 
 
 async def send_file(ws, st, path, mid):
@@ -442,7 +564,7 @@ def cancel_download(st):
     st.download = None
 
 
-async def handle_files(ws, st, msg):
+async def handle_files(ws, st, msg, monitors):
     """Handle a file-transfer message. Returns False if the message is something else."""
     t, mid = msg.get("t"), msg.get("id")
 
@@ -453,6 +575,7 @@ async def handle_files(ws, st, msg):
         try:
             listing = await asyncio.get_running_loop().run_in_executor(
                 None, list_dir, str(msg.get("path") or ""))
+            add_links(ws, listing)
             await reply(t="ls", **listing)
         except OSError as exc:
             await reply(t="ls_err", msg=exc.strerror or str(exc))
@@ -465,10 +588,11 @@ async def handle_files(ws, st, msg):
     elif t == "up_end":
         if st.upload and st.upload["id"] == mid:
             try:
-                size = st.upload["size"]
+                size, at = st.upload["size"], st.upload["at"]
                 final = upload_finish(st)
-                log(f"{st.ip}: sent file {final.name} ({fmt_size(size)}) -> {RECEIVED_DIR}")
-                await reply(t="up_ok", id=mid, name=final.name)
+                final, where = await place_dropped(st, final, at, monitors)
+                log(f"{st.ip}: sent file {final.name} ({fmt_size(size)}) -> {where or final.parent}")
+                await reply(t="up_ok", id=mid, name=final.name, where=where or "Received files")
             except OSError as exc:
                 await reply(t="up_err", id=mid, msg=exc.strerror or str(exc))
     elif t == "up_cancel":
@@ -535,7 +659,7 @@ async def receive(ws, st, monitors):
                     CHAT_SINK(st.ip, text)
                 elif text:
                     log(f"{st.ip} says: {text}")
-            elif not VIEW_ONLY and not await handle_files(ws, st, msg):
+            elif not VIEW_ONLY and not await handle_files(ws, st, msg, monitors):
                 handle_input(st, monitors, msg)
                 st.wake.set()  # capture again right away instead of waiting for the next tick
         except (KeyError, ValueError, TypeError):
@@ -572,8 +696,12 @@ async def handler(ws):
         return
     st = Session()
     st.ip = ip
+    agent = bool(agent_client) and await asyncio.get_running_loop().run_in_executor(None, agent_client.available)
+    if agent:
+        st.io = agent_client.Input(inp)
     SESSIONS[ws] = {"ip": ip, "since": time.time()}
-    log(f"{ip}: CONNECTED" + (" (view only)" if VIEW_ONLY else " (full control)"))
+    log(f"{ip}: CONNECTED" + (" (view only)" if VIEW_ONLY else " (full control)")
+        + (" - UAC prompts and the lock screen included" if agent else ""))
     streamer = None
     try:
         await ws.send(json.dumps({
@@ -590,8 +718,13 @@ async def handler(ws):
         if streamer:
             streamer.cancel()
         release_all(st)  # never leave keys or buttons stuck down
+        if st.io is not inp:
+            st.io.close()
+        if agent_client and isinstance(st.frame, agent_client.View):
+            st.frame.conn.close()
         upload_abort(st)  # discard a half-received file
         cancel_download(st)
+        drop_links(ws)
         SESSIONS.pop(ws, None)
         log(f"{ip}: disconnected")
 
@@ -606,10 +739,12 @@ def http_response(status, reason, body, content_type="text/plain; charset=utf-8"
     return Response(status, reason, headers, body)
 
 
-def process_request(connection, request):
+async def process_request(connection, request):
     path = request.path.split("?", 1)[0]
     if path == "/ws":
         return None  # continue with the WebSocket handshake
+    if path.startswith("/dl/"):
+        return await serve_link(path[4:])
     if path in ("/", "/index.html"):
         body = (HERE / "viewer.html").read_bytes()
         return http_response(200, "OK", body, "text/html; charset=utf-8")
@@ -650,8 +785,6 @@ async def main():
     ap.add_argument("--password", default=os.environ.get("RD_PASSWORD"),
                     help="access password (default: random, printed at startup)")
     ap.add_argument("--view-only", action="store_true", help="stream the screen but ignore input")
-    ap.add_argument("--allow-uac", action="store_true",
-                    help="disable Windows secure desktop so UAC prompts can be seen and clicked remotely")
     ap.add_argument("--cert", help="TLS certificate (PEM) to serve over HTTPS")
     ap.add_argument("--key", help="TLS private key (PEM)")
     args = ap.parse_args()
@@ -659,14 +792,6 @@ async def main():
     generated = not args.password
     PASSWORD = args.password or secrets.token_urlsafe(9)
     VIEW_ONLY = args.view_only
-
-    if sys.platform == "win32" and args.allow_uac:
-        try:
-            import secure_desktop
-            secure_desktop.set_secure_desktop(False)
-            print("UAC: Secure desktop disabled. UAC prompts can be viewed and controlled remotely.\n")
-        except Exception as exc:
-            print(f"UAC warning: could not disable secure desktop ({exc}). Run as administrator.\n")
 
     ctx = None
     if args.cert:

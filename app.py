@@ -2,7 +2,8 @@
 
 Share this computer (ID + password) or control another one. Run from source
 with start.bat / `python app.py`, or install it with the packaged installer.
-`--minimized` starts with the window minimised (used when opening at sign-in).
+`--minimized` starts hidden in the tray (used when opening at sign-in). Closing the
+window keeps the app running in the background; quit from the tray icon.
 """
 
 import asyncio
@@ -15,6 +16,7 @@ import queue
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -23,18 +25,92 @@ import tkinter as tk
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import autostart
 import host
 import rendezvous
 import secure_desktop
+import theme
+import tray
+import updater
+from version import VERSION
+
+if sys.platform == "win32":
+    import winagent
+else:
+    winagent = None
+
+# One copy at a time. A running copy listens here (this computer only); opening the app
+# again asks it to show its window instead of starting a second copy that would fight
+# over the sharing port and add a second tray icon.
+INSTANCE_PORT = 47613
+
+
+def ask_running_copy(action):
+    """Send `action` ("show" or "ping") to a copy that is already running. True if one answered."""
+    try:
+        with socket.create_connection(("127.0.0.1", INSTANCE_PORT), timeout=1.5) as conn:
+            conn.sendall(action.encode() + b"\n")
+            return conn.recv(16).startswith(b"ok")
+    except OSError:
+        return False
+
+
+class InstanceServer:
+    """Answers ask_running_copy() for the copy that is running."""
+
+    def __init__(self, post):
+        self.post = post
+        self.sock = None
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        deadline = time.monotonic() + 8  # a copy that is closing (elevated restart) may still hold it
+        while True:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                srv.bind(("127.0.0.1", INSTANCE_PORT))
+                srv.listen(4)
+                break
+            except OSError:
+                srv.close()
+                if time.monotonic() > deadline:
+                    return
+                time.sleep(0.5)
+        self.sock = srv
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return  # closed by stop()
+            with conn:
+                try:
+                    conn.settimeout(2)
+                    line = conn.recv(64).decode("ascii", "ignore").strip()
+                    if line in ("show", "ping"):
+                        if line == "show":
+                            self.post("open")
+                        conn.sendall(b"ok\n")
+                except OSError:
+                    pass
+
+    def stop(self):
+        sock, self.sock = self.sock, None
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 WINDOWS, MAC = sys.platform == "win32", sys.platform == "darwin"
 HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # also right when packaged
 TUNNEL_URL = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com")
 MIN_PASSWORD = 10
-GREEN, GREY, AMBER = "#22a35a", "#9aa0a6", "#d98a00"
 
 
 def find_cloudflared():
@@ -336,34 +412,53 @@ class App:
         self.registered = None      # None = not yet known, True/False = number lookup works or not
         self.last_publish = 0.0
         self.auto_share = tk.BooleanVar(value=bool(saved.get("auto_share", False)))
-        self.auto_launch = tk.BooleanVar(value=autostart.is_enabled())
-        # Remote-admin mode: elevate the admin without a UAC prompt so remote admin tasks aren't blocked.
-        saved_uac = saved.get("show_uac")
-        if saved_uac is not None:
-            self.show_uac = tk.BooleanVar(value=bool(saved_uac))
-        else:
-            self.show_uac = tk.BooleanVar(value=(secure_desktop.is_remote_admin_on() is True))
+        # Opening at sign-in is on by default; once applied, the user's own choice is kept.
+        self.launch_default_pending = not saved.get("launch_default_done", False)
+        self.auto_launch = tk.BooleanVar(value=autostart.is_enabled() or self.launch_default_pending)
+        self.selftest = "--selftest" in sys.argv
+        self.tray = tray.Tray(str(HERE / "assets" / "icon-256.png"),
+                              lambda action: self.events.put(("tray", action)))
+        self.instance = InstanceServer(lambda action: self.events.put(("tray", action)))
+        self.background_notice_shown = False
+        self.closed = False
+        self.uac_restored = bool(saved.get("uac_restored", False))
+        self.last_update_check = float(saved.get("last_update_check", 0))
+        self.update_busy = False
+        self.update_repo = tk.StringVar(value=str(saved.get("update_repo") or updater.REPO or ""))
+        if updater.normalize(self.update_repo.get()):
+            updater.SOURCE = updater.normalize(self.update_repo.get())
 
-        root.title("Remote Desktop")
-        try:  # window/taskbar icon; True also applies it to the chat window
-            self.icon = tk.PhotoImage(file=str(HERE / "assets" / "icon-256.png"))
-            root.iconphoto(True, self.icon)
+        root.title(f"Remote Desktop {VERSION}")
+        try:  # window and taskbar icon; on Windows the .ico has crisp small sizes
+            if WINDOWS:
+                root.iconbitmap(default=str(HERE / "assets" / "icon.ico"))
+            else:
+                self.icon = tk.PhotoImage(file=str(HERE / "assets" / "icon-256.png"))
+                root.iconphoto(True, self.icon)
         except tk.TclError:
             pass
         root.minsize(860, 0)
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.protocol("WM_DELETE_WINDOW", self.hide_window)  # closing keeps it running in the background
+        self.theme = theme.Theme(root)  # light or dark, following the system setting
+        self.theme.window(root)
         self.build()
+        self.theme.on_change = self.refresh  # the status dot and share button colours
+        self.theme.follow_system()
         self.my_id.set(rendezvous.pretty(self.number))
-        if WINDOWS and is_admin() and self.show_uac.get():
-            try:
-                secure_desktop.set_remote_admin(True)
-            except OSError:
-                pass
-        if WINDOWS and secure_desktop.is_remote_admin_on() is True:
-            self.note("Note: remote-admin mode is on — admin actions on this PC run without a UAC prompt.")
+        if not self.selftest:
+            self.restore_uac()
+            self.tray.start()
+            self.instance.start()
+            root.after(1500, self.apply_autostart)
+            root.after(5000, lambda: self.check_updates(manual=False))
+            threading.Thread(target=updater.cleanup, daemon=True).start()
+        self.refresh_service()
         self.refresh()
-        if "--minimized" in sys.argv:
-            root.iconify()
+        if "--minimized" in sys.argv:  # opened at sign-in: start out of the way
+            if self.tray.available:
+                root.withdraw()
+            else:
+                root.iconify()
         if "--share" in sys.argv:  # restarted as administrator while sharing: wait for the old copy to exit
             root.after(2500, lambda: self.start(quiet=True))
         elif self.auto_share.get():
@@ -373,146 +468,211 @@ class App:
 
     # ---- layout ----
     def build(self):
-        main = ttk.Frame(self.root, padding=10)
+        """Light, simplified layout: two cards (share / connect), connected devices and
+        activity, and everything else under Settings."""
+        root = self.root
+        th = self.theme
+
+        def card(parent, title, **grid):
+            frame = th.paint(tk.Frame(parent, highlightthickness=1, padx=20, pady=16),
+                             bg="card", highlightbackground="border", highlightcolor="border")
+            frame.grid(**grid)
+            frame.columnconfigure(0, weight=1)
+            if title:
+                ttk.Label(frame, text=title, style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+            return frame
+
+        def accent(parent, text, color, command):
+            return th.accent_button(parent, text, command, color)
+
+        main = ttk.Frame(root, padding=(18, 14, 18, 16))
         main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
 
+        # ---- header: status, version / updates, chat ----
         head = ttk.Frame(main)
-        head.grid(sticky="ew")
-        head.columnconfigure(1, weight=1)
-        self.dot = tk.Canvas(head, width=18, height=18, highlightthickness=0)
-        self.dot_id = self.dot.create_oval(3, 3, 15, 15, fill=GREY, outline="")
+        head.grid(row=0, column=0, sticky="ew")
+        head.columnconfigure(2, weight=1)
+        self.dot = th.paint(tk.Canvas(head, width=14, height=14, highlightthickness=0), bg="bg")
+        self.dot_id = self.dot.create_oval(2, 2, 12, 12, fill=th.pal["grey"], outline="")
         self.dot.grid(row=0, column=0, padx=(0, 8))
-        self.status = ttk.Label(head, text="", font=("Segoe UI", 13, "bold"))
+        self.status = ttk.Label(head, text="", style="Status.TLabel")
         self.status.grid(row=0, column=1, sticky="w")
-        ttk.Button(head, text="Chat", width=8, command=self.open_chat).grid(row=0, column=2, padx=(0, 8))
-        self.toggle_btn = ttk.Button(head, text="Start sharing", width=16, command=self.toggle)
-        self.toggle_btn.grid(row=0, column=3)
+        self.update_label = ttk.Label(head, text=f"Version {VERSION}", style="BgMuted.TLabel")
+        self.update_label.grid(row=0, column=3, padx=(0, 8))
+        self.update_btn = ttk.Button(head, text="Check for updates",
+                                     command=lambda: self.check_updates(manual=True))
+        self.update_btn.grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(head, text="Chat", width=8, command=self.open_chat).grid(row=0, column=5)
 
-        panes = ttk.Frame(main)
-        panes.grid(sticky="ew", pady=(14, 0))
-        panes.columnconfigure(0, weight=1, uniform="pane")
-        panes.columnconfigure(1, weight=1, uniform="pane")
-        big = ("Segoe UI", 11)
+        # ---- the two cards ----
+        cards = ttk.Frame(main)
+        cards.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        cards.columnconfigure(0, weight=1, uniform="card")
+        cards.columnconfigure(1, weight=1, uniform="card")
 
-        allow = ttk.LabelFrame(panes, text="Allow remote control", padding=8)
-        allow.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        allow.columnconfigure(0, weight=1)
-        ttk.Label(allow, text="Give this ID and password to the person who will connect.",
-                  wraplength=370, foreground="#555").grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(allow, text="Your ID (9 digits)").grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 2))
-        self.id_entry = ttk.Entry(allow, textvariable=self.my_id, font=big + ("bold",))
-        self.id_entry.grid(row=2, column=0, sticky="ew")
-        ttk.Button(allow, text="Copy", width=6,
-                   command=lambda: self.id_ready and self.copy(self.my_id.get())
-                   ).grid(row=2, column=1, padx=(6, 0))
-        self.new_id_btn = ttk.Button(allow, text="New", width=6, command=self.new_number)
-        self.new_id_btn.grid(row=2, column=2, padx=(6, 0))
-        ttk.Label(allow, text="Password").grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 2))
-        self.pw_entry = ttk.Entry(allow, textvariable=self.password, show="•", font=big)
-        self.pw_entry.grid(row=4, column=0, sticky="ew")
-        ttk.Button(allow, text="Copy", width=6,
-                   command=lambda: self.copy(self.password.get())).grid(row=4, column=1, padx=(6, 0))
-        self.new_btn = ttk.Button(allow, text="New", width=6, command=self.new_password)
-        self.new_btn.grid(row=4, column=2, padx=(6, 0))
-        ttk.Checkbutton(allow, text="Show ID and password", variable=self.show_pw, command=self.toggle_show
-                        ).grid(row=5, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(allow, text="Both stay the same until you change them. Stop sharing to edit.",
-                  wraplength=370, foreground="#555").grid(row=6, column=0, columnspan=3, sticky="w")
+        share = card(cards, "Allow remote control", row=0, column=0, sticky="nsew", padx=(0, 8))
+        ttk.Label(share, text="Give this ID and password to the person who will connect.",
+                  style="Muted.TLabel", wraplength=420).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 10))
+        ttk.Label(share, text="Your ID", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
+        self.id_entry = ttk.Entry(share, textvariable=self.my_id, font=(theme.FONT, 18, "bold"), width=14)
+        self.id_entry.grid(row=3, column=0, sticky="ew")
+        ttk.Button(share, text="Copy", width=6, command=lambda: self.id_ready and self.copy(self.my_id.get())
+                   ).grid(row=3, column=1, padx=(6, 0))
+        self.new_id_btn = ttk.Button(share, text="New", width=5, command=self.new_number)
+        self.new_id_btn.grid(row=3, column=2, padx=(4, 0))
+        ttk.Label(share, text="Password", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        self.pw_entry = ttk.Entry(share, textvariable=self.password, show="•", font=(theme.FONT, 14), width=14)
+        self.pw_entry.grid(row=5, column=0, sticky="ew")
+        ttk.Button(share, text="Copy", width=6, command=lambda: self.copy(self.password.get())
+                   ).grid(row=5, column=1, padx=(6, 0))
+        self.new_btn = ttk.Button(share, text="New", width=5, command=self.new_password)
+        self.new_btn.grid(row=5, column=2, padx=(4, 0))
+        ttk.Checkbutton(share, text="Show ID and password", variable=self.show_pw, command=self.toggle_show,
+                        style="Card.TCheckbutton").grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.toggle_btn = accent(share, "Start sharing", "green", self.toggle)
+        self.toggle_btn.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 0))
 
-        ctrl = ttk.LabelFrame(panes, text="Control a remote computer", padding=8)
-        ctrl.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        ctrl.columnconfigure(0, weight=1)
+        ctrl = card(cards, "Control a remote computer", row=0, column=1, sticky="nsew", padx=(8, 0))
         ttk.Label(ctrl, text="Enter the ID and password shown on the other computer.",
-                  wraplength=370, foreground="#555").grid(row=0, column=0, sticky="w")
-        ttk.Label(ctrl, text="Partner ID").grid(row=1, column=0, sticky="w", pady=(10, 2))
-        partner_entry = ttk.Entry(ctrl, textvariable=self.partner, font=big)
-        partner_entry.grid(row=2, column=0, sticky="ew")
-        ttk.Label(ctrl, text="Password").grid(row=3, column=0, sticky="w", pady=(10, 2))
-        partner_pw_entry = ttk.Entry(ctrl, textvariable=self.partner_pw, show="•", font=big)
-        partner_pw_entry.grid(row=4, column=0, sticky="ew")
+                  style="Muted.TLabel", wraplength=420).grid(row=1, column=0, sticky="w", pady=(2, 10))
+        ttk.Label(ctrl, text="Partner ID", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
+        partner_entry = ttk.Entry(ctrl, textvariable=self.partner, font=(theme.FONT, 18))
+        partner_entry.grid(row=3, column=0, sticky="ew")
+        ttk.Label(ctrl, text="Password", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        partner_pw_entry = ttk.Entry(ctrl, textvariable=self.partner_pw, show="•", font=(theme.FONT, 14))
+        partner_pw_entry.grid(row=5, column=0, sticky="ew")
         for entry in (partner_entry, partner_pw_entry):
             entry.bind("<Return>", lambda _e: self.connect_partner())
-        self.connect_btn = ttk.Button(ctrl, text="Connect", width=12, command=self.connect_partner)
-        self.connect_btn.grid(row=5, column=0, sticky="e", pady=(8, 0))
-        self.partner_msg = ttk.Label(ctrl, text="", wraplength=370, foreground="#c0392b")
-        self.partner_msg.grid(row=6, column=0, sticky="w")
+        self.partner_msg = ttk.Label(ctrl, text="", style="Error.TLabel", wraplength=340)
+        self.partner_msg.grid(row=6, column=0, sticky="w", pady=(8, 0))
+        ctrl.rowconfigure(6, weight=1)
+        self.connect_btn = accent(ctrl, "Connect", "accent", self.connect_partner)
+        self.connect_btn.grid(row=7, column=0, sticky="ew", pady=(12, 0))
 
-        access = ttk.LabelFrame(main, text="Options", padding=8)
-        access.grid(sticky="ew", pady=(8, 0))
-        self.control_chk = ttk.Checkbutton(
-            access, text="Allow mouse and keyboard control", variable=self.control)
-        self.control_chk.grid(row=0, column=0, sticky="w")
-        self.internet_chk = ttk.Checkbutton(
-            access, text="Allow connections from the internet", variable=self.internet)
-        self.internet_chk.grid(row=0, column=1, sticky="w", padx=(24, 0))
-        access.columnconfigure(2, weight=1)
-        ttk.Label(access, text="Port").grid(row=0, column=3, sticky="e", padx=(0, 8))
-        self.port_entry = ttk.Entry(access, textvariable=self.port, width=8)
-        self.port_entry.grid(row=0, column=4, sticky="e")
-        ttk.Checkbutton(access, text="Start sharing when the app opens", variable=self.auto_share,
-                        command=self.save).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Checkbutton(access, text="Open the app when I sign in to this computer",
-                        variable=self.auto_launch, command=self.toggle_auto_launch
-                        ).grid(row=1, column=1, columnspan=4, sticky="w", padx=(24, 0), pady=(4, 0))
-        if WINDOWS and is_admin():
-            ttk.Label(access, text="Running as administrator: Task Manager and other administrator "
-                                   "windows can be controlled.", foreground="#22a35a"
-                      ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
-        elif WINDOWS:
-            admin = ttk.Frame(access)
-            admin.grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
-            ttk.Button(admin, text="Restart as administrator", command=self.restart_as_admin).pack(side="left")
-            ttk.Label(admin, text="  Needed to control Task Manager and other administrator windows.",
-                      foreground="#555").pack(side="left")
-        if WINDOWS:
-            self.uac_chk = ttk.Checkbutton(
-                access, text="Run admin tasks remotely without a UAC prompt (less secure)",
-                variable=self.show_uac, command=self.toggle_uac)
-            self.uac_chk.grid(row=3, column=0, columnspan=5, sticky="w", pady=(4, 0))
-
-        links = ttk.LabelFrame(main, text="Or open one of these in any browser (no app needed)", padding=8)
-        links.grid(sticky="ew", pady=(8, 0))
+        # ---- browser access: open one of these on the other computer, no app needed ----
+        links = card(main, None, row=2, column=0, sticky="ew", pady=(12, 0))
         links.columnconfigure(1, weight=1)
-        for row, (key, label) in enumerate((("local", "This PC"), ("lan", "Same network"), ("net", "Internet"))):
-            ttk.Label(links, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=2)
+        ttk.Label(links, text="Browser access", style="Head.TLabel"
+                  ).grid(row=0, column=0, sticky="w")
+        ttk.Label(links, text="Open one of these in any browser on the other computer (no app needed).",
+                  style="Muted.TLabel").grid(row=0, column=1, columnspan=2, sticky="w", padx=(10, 0))
+        for i, (key, label) in enumerate((("local", "This PC"), ("lan", "Same network"), ("net", "Internet")), 1):
+            ttk.Label(links, text=label, style="Card.TLabel").grid(row=i, column=0, sticky="w", padx=(0, 10), pady=(4, 0))
             self.addr_entries[key] = ttk.Entry(links, textvariable=self.addr[key], state="readonly")
-            self.addr_entries[key].grid(row=row, column=1, sticky="ew", pady=2)
-            ttk.Button(links, text="Copy", width=7,
-                       command=lambda k=key: self.copy(self.addr[k].get(), url=True)
-                       ).grid(row=row, column=2, padx=(8, 0), pady=2)
+            self.addr_entries[key].grid(row=i, column=1, sticky="ew", pady=(4, 0))
+            ttk.Button(links, text="Copy", width=6, command=lambda k=key: self.copy(self.addr[k].get(), url=True)
+                       ).grid(row=i, column=2, padx=(6, 0), pady=(4, 0))
 
-        bottom = ttk.Frame(main)  # devices and activity share one row to keep the window short
-        bottom.grid(sticky="nsew", pady=(8, 0))
-        bottom.columnconfigure(0, weight=1, uniform="bottom")
-        bottom.columnconfigure(1, weight=1, uniform="bottom")
-        bottom.rowconfigure(0, weight=1)
-
-        devices = ttk.LabelFrame(bottom, text="Connected devices", padding=8)
-        devices.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        # ---- connected devices and activity ----
+        bottom = card(main, None, row=3, column=0, sticky="nsew", pady=(12, 0))
+        main.rowconfigure(3, weight=1)
+        bottom.columnconfigure(0, weight=2)
+        bottom.columnconfigure(1, weight=3)
+        bottom.rowconfigure(1, weight=1)
+        ttk.Label(bottom, text="Connected devices", style="Head.TLabel"
+                  ).grid(row=0, column=0, sticky="w")
+        ttk.Label(bottom, text="Activity", style="Head.TLabel"
+                  ).grid(row=0, column=1, sticky="w", padx=(16, 0))
+        devices = ttk.Frame(bottom, style="Card.TFrame")
+        devices.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
         devices.columnconfigure(0, weight=1)
         self.tree = ttk.Treeview(devices, columns=("ip", "since"), show="headings", height=2, selectmode="none")
         self.tree.heading("ip", text="Address", anchor="w")
         self.tree.heading("since", text="Since", anchor="w")
-        self.tree.column("ip", width=150, anchor="w")
-        self.tree.column("since", width=80, anchor="w")
-        self.tree.grid(row=0, column=0, sticky="ew")
+        self.tree.column("ip", width=140, anchor="w")
+        self.tree.column("since", width=70, anchor="w")
+        self.tree.grid(row=0, column=0, columnspan=2, sticky="ew")
         self.kick_btn = ttk.Button(devices, text="Disconnect all", command=self.disconnect_all)
-        self.kick_btn.grid(row=0, column=1, sticky="new", padx=(10, 0))
+        self.kick_btn.grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Button(devices, text="Received files", command=self.open_received
-                   ).grid(row=0, column=1, sticky="sew", padx=(10, 0))
-
-        activity = ttk.LabelFrame(bottom, text="Activity", padding=8)
-        activity.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        activity.columnconfigure(0, weight=1)
-        activity.rowconfigure(0, weight=1)
-        main.rowconfigure(4, weight=1)
-        self.logbox = tk.Text(activity, height=3, width=30, state="disabled", wrap="word",
-                              relief="flat", font=("Consolas", 9))
-        scroll = ttk.Scrollbar(activity, command=self.logbox.yview)
+                   ).grid(row=1, column=1, sticky="e", pady=(6, 0))
+        logwrap = ttk.Frame(bottom, style="Card.TFrame")
+        logwrap.grid(row=1, column=1, sticky="nsew", padx=(16, 0), pady=(6, 0))
+        logwrap.columnconfigure(0, weight=1)
+        logwrap.rowconfigure(0, weight=1)
+        self.logbox = th.paint(tk.Text(logwrap, height=4, width=30, state="disabled", wrap="word", relief="flat",
+                                       font=(theme.MONO, 9), padx=8, pady=6, highlightthickness=1, bd=0),
+                               bg="log", fg="text", highlightbackground="border", highlightcolor="border",
+                               insertbackground="text")
+        scroll = ttk.Scrollbar(logwrap, command=self.logbox.yview)
         self.logbox.configure(yscrollcommand=scroll.set)
         self.logbox.grid(row=0, column=0, sticky="nsew")
         scroll.grid(row=0, column=1, sticky="ns")
+
+        # ---- settings: a separate window, opened from the header ----
+        ttk.Button(head, text="Settings", width=9, command=self.toggle_settings).grid(row=0, column=6, padx=(8, 0))
+        win = tk.Toplevel(root)
+        win.withdraw()
+        win.title("Settings - Remote Desktop")
+        self.theme.window(win)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", win.withdraw)
+        self.settings_win = win
+        outer = ttk.Frame(win, padding=14)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        sets = card(outer, "Settings", row=0, column=0, sticky="nsew")
+        body = ttk.Frame(sets, style="Card.TFrame")  # below the title
+        body.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        sets = body
+        sets.columnconfigure(1, weight=1)
+        self.control_chk = ttk.Checkbutton(sets, text="Allow mouse and keyboard control",
+                                           variable=self.control, style="Card.TCheckbutton")
+        self.control_chk.grid(row=0, column=0, sticky="w")
+        self.internet_chk = ttk.Checkbutton(sets, text="Allow connections from the internet",
+                                            variable=self.internet, style="Card.TCheckbutton")
+        self.internet_chk.grid(row=0, column=1, sticky="w", padx=(24, 0))
+        port = ttk.Frame(sets, style="Card.TFrame")
+        port.grid(row=0, column=2, sticky="e", padx=(16, 0))
+        ttk.Label(port, text="Port", style="Card.TLabel").pack(side="left", padx=(0, 6))
+        self.port_entry = ttk.Entry(port, textvariable=self.port, width=7)
+        self.port_entry.pack(side="left")
+        ttk.Checkbutton(sets, text="Start sharing when the app opens", variable=self.auto_share,
+                        command=self.save, style="Card.TCheckbutton").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(sets, text="Open the app when I sign in", variable=self.auto_launch,
+                        command=self.toggle_auto_launch, style="Card.TCheckbutton"
+                        ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(24, 0), pady=(6, 0))
+        row = 2
+        if WINDOWS:
+            admin = ttk.Frame(sets, style="Card.TFrame")
+            admin.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+            if is_admin():
+                ttk.Label(admin, text="Running as administrator: Task Manager and other administrator "
+                                      "windows can be controlled.", style="Good.TLabel"
+                          ).pack(side="left")
+            else:
+                ttk.Button(admin, text="Restart as administrator", command=self.restart_as_admin).pack(side="left")
+                ttk.Label(admin, text="Needed to control Task Manager and other administrator windows.",
+                          style="Muted.TLabel").pack(side="left", padx=(8, 0))
+            svc = ttk.Frame(sets, style="Card.TFrame")
+            svc.grid(row=row + 1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+            self.svc_btn = ttk.Button(svc, text="Install service", width=16, command=self.toggle_service)
+            self.svc_btn.pack(side="left")
+            self.svc_label = ttk.Label(svc, text="", style="Muted.TLabel", wraplength=620)
+            self.svc_label.pack(side="left", padx=(8, 0))
+            row += 2
+        upd = ttk.Frame(sets, style="Card.TFrame")
+        upd.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        upd.columnconfigure(1, weight=1)
+        ttk.Label(upd, text="Updates from GitHub", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        repo_entry = ttk.Entry(upd, textvariable=self.update_repo)
+        repo_entry.grid(row=0, column=1, sticky="ew")
+        repo_entry.bind("<Return>", lambda _e: self.set_update_repo(self.update_repo.get()))
+        ttk.Button(upd, text="Save", width=6, command=lambda: self.set_update_repo(self.update_repo.get())
+                   ).grid(row=0, column=2, padx=(6, 0))
+        ttk.Label(upd, text="The repository whose Releases hold the installers, e.g. myname/remote-desktop.",
+                  style="Muted.TLabel").grid(row=1, column=1, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Button(outer, text="Close", width=10, command=win.withdraw).grid(row=1, column=0, sticky="e", pady=(10, 0))
+
+    def toggle_settings(self):
+        """Open the Settings window next to the main window."""
+        win = self.settings_win
+        win.transient(self.root)
+        win.geometry(f"+{self.root.winfo_rootx() + 40}+{self.root.winfo_rooty() + 40}")
+        win.deiconify()
+        win.lift()
+        win.focus_force()
 
     # ---- small actions ----
     def toggle_show(self):
@@ -556,17 +716,20 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("Chat - Remote Desktop")
         win.minsize(640, 480)
-        frame = ttk.Frame(win, padding=8)
+        self.theme.window(win)
+        frame = ttk.Frame(win, padding=14)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        self.chat_box = tk.Text(frame, height=12, width=48, state="disabled", wrap="word",
-                                relief="flat", font=("Segoe UI", 10))
+        self.chat_box = self.theme.paint(
+            tk.Text(frame, height=12, width=48, state="disabled", wrap="word", relief="flat", bd=0,
+                    font=(theme.FONT, 10), padx=10, pady=8, highlightthickness=1),
+            bg="card", fg="text", highlightbackground="border", highlightcolor="border")
         self.chat_box.grid(row=0, column=0, columnspan=2, sticky="nsew")
-        entry = ttk.Entry(frame, textvariable=self.chat_text, font=("Segoe UI", 10))
-        entry.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        entry = ttk.Entry(frame, textvariable=self.chat_text, font=(theme.FONT, 10))
+        entry.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         entry.bind("<Return>", lambda _e: self.send_chat())
-        ttk.Button(frame, text="Send", command=self.send_chat).grid(row=1, column=1, padx=(8, 0), pady=(8, 0))
+        self.theme.accent_button(frame, "Send", self.send_chat).grid(row=1, column=1, padx=(8, 0), pady=(10, 0))
         win.protocol("WM_DELETE_WINDOW", win.withdraw)
         self.chat_win = win
         for line in self.chat_lines:
@@ -613,7 +776,10 @@ class App:
             save_settings(self.password.get(), port=port, control=self.control.get(),
                           internet=self.internet.get(), id=self.number,
                           auto_share=self.auto_share.get(),
-                          show_uac=self.show_uac.get())
+                          uac_restored=self.uac_restored,
+                          last_update_check=self.last_update_check,
+                          update_repo=self.update_repo.get().strip(),
+                          launch_default_done=not self.launch_default_pending)
         except OSError as exc:
             self.note(f"Could not save settings: {exc}")
 
@@ -635,6 +801,7 @@ class App:
             params = [str(Path(__file__).resolve())]
         if self.state == "running":
             params.append("--share")  # carry on sharing after the restart
+        params.append("--restarted")  # this copy is closing; the new one must not hand over to it
         self.save()
         shell32 = ctypes.windll.shell32
         shell32.ShellExecuteW.restype = ctypes.c_void_p
@@ -646,44 +813,180 @@ class App:
         else:
             self.note("Administrator permission was not given; nothing changed.")
 
-    def toggle_uac(self):
-        """Move UAC prompts off (or back onto) the secure desktop so a remote viewer can see and control them."""
+    # ---- UAC: the background service replaces the old "no UAC prompt" mode ----
+    def restore_uac(self):
+        """Earlier versions could switch UAC to 'elevate without prompting' (and fix_uac.bat
+        did the same). That mode is gone; put Windows' normal UAC prompt back, once."""
+        if not WINDOWS or self.uac_restored or not is_admin():
+            return
+        try:
+            if secure_desktop.is_remote_admin_on() is True or secure_desktop.is_secure_desktop_on() is False:
+                secure_desktop.set_remote_admin(False)  # prompt for consent, on the secure desktop
+                self.note("Windows' normal UAC prompt has been turned back on. With the background "
+                          "service running, prompts can still be answered remotely.")
+            self.uac_restored = True
+            self.save()
+        except OSError as exc:
+            self.note(f"Could not restore the normal UAC prompt: {exc}")
+
+    def refresh_service(self):
+        if not WINDOWS:
+            return
+        state = winagent.service_state()
+        problem = winagent.install_problem()
+        if state in ("running", "stopped"):
+            self.svc_btn.configure(text="Remove service", state="normal")
+            text = ("Service on: UAC prompts and the sign-in screen can be controlled remotely."
+                    if state == "running" else "Service installed but not running.")
+            if not is_admin():
+                text += " Needs the app running as administrator."
+        else:
+            self.svc_btn.configure(text="Install service", state="disabled" if problem else "normal")
+            text = "Service off: UAC prompts and the sign-in screen can't be controlled remotely."
+            if problem and not getattr(sys, "frozen", False):
+                text += " (Installed app only.)"
+            elif problem:
+                text += " Reinstall with the latest installer to enable it."
+        self.svc_label.configure(text=text)
+
+    def toggle_service(self):
         if not is_admin():
-            self.show_uac.set(not self.show_uac.get())  # keep previous state
-            if messagebox.askyesno(
-                    "Administrator rights required",
-                    "Controlling UAC prompts remotely requires running Remote Desktop as administrator.\n\n"
-                    "Would you like to restart the app as administrator now?"):
+            if messagebox.askyesno("Administrator rights required",
+                                   "Installing or removing the service needs administrator rights.\n\n"
+                                   "Restart the app as administrator now?"):
                 self.restart_as_admin()
             return
+        installed = winagent.service_state() in ("running", "stopped")
+        if installed and not messagebox.askokcancel(
+                "Remove the service?", "Without it, UAC prompts and the sign-in screen cannot be "
+                                       "controlled remotely."):
+            return
+        self.svc_btn.configure(state="disabled")
 
-        if self.show_uac.get():
-            if not messagebox.askokcancel(
-                    "Run admin tasks remotely without a UAC prompt?",
-                    "A UAC prompt can be seen remotely but never clicked — Windows protects it "
-                    "from injected input. To use this PC's admin tasks remotely, Windows must stop "
-                    "showing the prompt.\n\nThis sets \"elevate without prompting\" for the signed-in "
-                    "administrator: admin actions on this PC will run WITHOUT asking. That is a real "
-                    "security reduction — only turn it on for a machine you use for remote "
-                    "administration.\n\nUnchecking this restores the normal UAC prompt."):
-                self.show_uac.set(False)
+        def work():
+            try:
+                (winagent.uninstall_service if installed else winagent.install_service)()
+                self.events.put(("service", None))
+            except OSError as exc:
+                self.events.put(("service", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- updates (GitHub Releases) ----
+    def set_update_repo(self, text):
+        """Use the GitHub repository the user entered for updates. False if it is not one."""
+        repo = updater.normalize(text)
+        if not repo:
+            messagebox.showwarning("Updates", "That is not a GitHub repository. Use owner/name, "
+                                              "for example myname/remote-desktop.")
+            return False
+        self.update_repo.set(repo)
+        updater.SOURCE = repo
+        self.last_update_check = 0.0
+        self.save()
+        self.note(f"Updates will come from github.com/{repo}.")
+        return True
+
+    def check_updates(self, manual):
+        if self.update_busy:
+            return
+        if not updater.configured():
+            if not manual:
                 return
+            text = simpledialog.askstring(
+                "Where do updates come from?",
+                "Updates are downloaded from a GitHub repository's Releases.\n"
+                "Enter the repository (owner/name or its github.com link):",
+                initialvalue=self.update_repo.get(), parent=self.root)
+            if text is None or not self.set_update_repo(text):
+                return
+        if not manual and time.time() - self.last_update_check < 20 * 3600:
+            return  # automatic checks at most about once a day
+        self.update_busy = True
+        self.update_btn.configure(state="disabled")
+        self.update_label.configure(text="Checking for updates…")
+
+        def work():
             try:
-                secure_desktop.set_remote_admin(True)
-                self.save()
-                self.note("Remote-admin mode on: admin actions now run without a UAC prompt.")
+                self.events.put(("update", (manual, updater.check(), None)))
+            except updater.NoReleases as exc:
+                self.events.put(("update", (manual, "none", str(exc))))
             except OSError as exc:
-                self.show_uac.set(False)
-                messagebox.showwarning(
-                    "Could not change the setting",
-                    "This needs the app to be running as administrator.\n\n" + str(exc))
-        else:
+                self.events.put(("update", (manual, None, str(exc))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_info(self, manual, info, error):
+        self.update_busy = False
+        self.update_btn.configure(state="normal")
+        if info == "none":  # the repository has no release yet: nothing to update to
+            self.last_update_check = time.time()
+            self.save()
+            self.update_label.configure(text=f"Version {VERSION} - no releases published yet")
+            if manual:
+                messagebox.showinfo("Updates", f"You have version {VERSION}.\n\n{error}\n\n"
+                                               "Publish one on GitHub (Releases > Draft a new release) "
+                                               "with RemoteDesktopSetup.exe attached.")
+            return
+        if error:
+            self.update_label.configure(text=f"Version {VERSION} - could not check for updates")
+            if manual:
+                messagebox.showwarning("Updates", f"Could not check for updates:\n{error}")
+            return
+        self.last_update_check = time.time()
+        self.save()
+        if not info:
+            self.update_label.configure(text=f"Version {VERSION} - up to date")
+            if manual:
+                messagebox.showinfo("Updates", f"You have the latest version ({VERSION}).")
+            return
+        self.update_label.configure(text=f"Version {VERSION} - version {info['version']} is available")
+        self.note(f"Version {info['version']} is available.")
+        if not manual and not self.root.winfo_viewable():  # running hidden: don't pop up a dialog
+            self.tray.notify(f"Version {info['version']} is available. Open Remote Desktop to update.")
+            return
+        if not info["asset"]:
+            if messagebox.askyesno("Update available", f"Version {info['version']} is available, but it has "
+                                                       "no installer for this system. Open the release page?"):
+                webbrowser.open(info["page"])
+            return
+        busy = " A device is connected and will be disconnected." if host.SESSIONS else ""
+        if not messagebox.askyesno(
+                "Update available",
+                f"Version {info['version']} is available (you have {VERSION}).\n\n"
+                f"Download and install it now?{busy}"):
+            return
+        self.update_busy = True
+        self.update_btn.configure(state="disabled")
+        self.update_label.configure(text=f"Downloading version {info['version']}…")
+
+        def progress(got, size):
+            self.events.put(("update_progress", (info["version"], got, size)))
+
+        def work():
             try:
-                secure_desktop.set_remote_admin(False)
-                self.save()
-                self.note("Normal UAC prompt restored.")
+                self.events.put(("update_ready", (updater.download(info, progress), None)))
             except OSError as exc:
-                messagebox.showwarning("Could not restore the setting", str(exc))
+                self.events.put(("update_ready", (None, str(exc))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_ready(self, path, error):
+        self.update_busy = False
+        self.update_btn.configure(state="normal")
+        if error:
+            self.update_label.configure(text=f"Version {VERSION} - update failed")
+            messagebox.showwarning("Update failed", error)
+            return
+        if not WINDOWS:
+            self.update_label.configure(text=f"Downloaded {path.name}")
+            messagebox.showinfo("Update downloaded", f"Open {path.name} to install the new version.")
+            updater.reveal(path)
+            return
+        try:
+            updater.install(path)
+        except OSError as exc:
+            messagebox.showwarning("Update failed", str(exc))
+            return
+        self.note("Installing the update; Remote Desktop will start again by itself.")
+        self.on_close(force=True)
 
     def toggle_auto_launch(self):
         try:
@@ -691,6 +994,54 @@ class App:
         except OSError as exc:
             self.auto_launch.set(autostart.is_enabled())
             messagebox.showwarning("Could not change startup", str(exc))
+        self.launch_default_pending = False  # the user has chosen; keep their choice
+        self.save()
+
+    def apply_autostart(self):
+        """Make sure 'open at sign-in' matches the checkbox, using the current program path.
+
+        Runs on every start: it switches an older sign-in entry over to the administrator
+        task (an administrator app cannot start from the plain sign-in list) and follows the
+        app if it was reinstalled elsewhere. It is on by default the first time."""
+        if not self.auto_launch.get():
+            return
+        admin = is_admin()
+
+        def work():
+            try:
+                if WINDOWS and not admin and autostart._task_exists():
+                    pass  # already set up by the administrator copy; this copy cannot change it
+                else:
+                    autostart.set_enabled(True, elevated=admin)
+                self.events.put(("autostart", None))
+            except OSError as exc:
+                self.events.put(("autostart", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- background (tray) ----
+    def hide_window(self):
+        """Closing the window keeps the app running (and sharing) in the background."""
+        if not self.tray.available:
+            self.root.iconify()  # no tray here (macOS): stay in the Dock / taskbar
+            return
+        self.root.withdraw()
+        if not self.background_notice_shown:
+            self.background_notice_shown = True
+            what = "sharing this screen" if self.state == "running" else "running"
+            self.tray.notify(f"Remote Desktop is still {what} in the background. "
+                             "Right-click the tray icon to open it or quit.")
+
+    def show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)  # bring it in front of other windows
+        self.root.after(300, lambda: self.root.attributes("-topmost", False))
+        self.root.focus_force()
+
+    def quit_app(self):
+        if host.SESSIONS:
+            self.show_window()  # so the "a device is connected" question is visible
+        self.on_close()
 
     # ---- start / stop ----
     def toggle(self):
@@ -768,13 +1119,13 @@ class App:
         self.addr["lan"].set(f"http://{lan[0]}:{port}" if lan else "No network connection found")
         mode = "view only" if host.VIEW_ONLY else "full control"
         self.note(f"Sharing started ({mode}).")
-        if WINDOWS and not host.VIEW_ONLY and not is_admin():
-            self.note("WARNING: Not running as administrator! You will lose control if a UAC prompt appears.")
-        elif WINDOWS and is_admin() and self.show_uac.get():
-            try:
-                secure_desktop.set_remote_admin(True)
-            except OSError:
-                pass
+        if WINDOWS and not host.VIEW_ONLY:
+            if not is_admin():
+                self.note("Not running as administrator: Task Manager, UAC prompts and other "
+                          "administrator windows cannot be controlled.")
+            elif winagent.service_state() != "running":
+                self.note("The background service is off: UAC prompts and the sign-in screen "
+                          "cannot be controlled. Click Install service.")
         if self.internet.get():
             self.addr["net"].set("Creating secure address…")
             try:
@@ -849,8 +1200,12 @@ class App:
         label = {"stopped": "Not sharing", "starting": "Starting…",
                  "running": "Sharing this screen", "stopping": "Stopping…"}[self.state]
         self.status.configure(text=label)
-        self.dot.itemconfigure(self.dot_id, fill=GREEN if running else GREY if self.state == "stopped" else AMBER)
-        self.toggle_btn.configure(text="Stop sharing" if running else "Start sharing",
+        pal = self.theme.pal
+        self.dot.itemconfigure(self.dot_id, fill=pal["green"] if running else pal["grey"] if self.state == "stopped"
+                               else pal["amber"])
+        self.theme.set_accent(self.toggle_btn, "red" if running else "green" if self.state == "stopped" else "amber")
+        self.toggle_btn.configure(text="Stop sharing" if running else label if self.state != "stopped"
+                                  else "Start sharing",
                                   state="normal" if self.state in ("stopped", "running") else "disabled")
         editable = "normal" if self.state == "stopped" else "disabled"
         for widget in (self.pw_entry, self.port_entry, self.new_btn, self.new_id_btn,
@@ -858,6 +1213,7 @@ class App:
             widget.configure(state=editable)
         self.id_entry.configure(state="normal" if self.state == "stopped" else "readonly")
         self.kick_btn.configure(state="normal" if running else "disabled")
+        self.tray.update(running, "Remote Desktop - " + label)
 
     # ---- event pump ----
     def poll(self):
@@ -866,6 +1222,39 @@ class App:
                 kind, data = self.events.get_nowait()
                 if kind == "log":
                     self.log(data)
+                elif kind == "tray":
+                    if data == "open":
+                        self.show_window()
+                    elif data == "toggle":
+                        self.toggle()
+                    elif data == "quit":
+                        self.quit_app()
+                        if self.closed:
+                            return  # the window is gone (it stays if the user cancelled)
+                elif kind == "autostart":
+                    if data:
+                        self.auto_launch.set(autostart.is_enabled())
+                        self.note(f"Could not set up opening at sign-in: {data}")
+                    elif self.launch_default_pending:
+                        self.launch_default_pending = False
+                        self.save()
+                        self.note("Remote Desktop will now open in the background when you sign in.")
+                elif kind == "service":
+                    if data:
+                        messagebox.showwarning("Service", data)
+                    else:
+                        self.note("Background service " + ("installed and started." if winagent.service_state()
+                                                           == "running" else "removed."))
+                    self.refresh_service()
+                elif kind == "update":
+                    self.on_update_info(*data)
+                elif kind == "update_progress":
+                    version, got, size = data
+                    self.update_label.configure(text=f"Downloading version {version}… {got * 100 // max(size, 1)}%")
+                elif kind == "update_ready":
+                    self.on_update_ready(*data)
+                    if self.closed:
+                        return
                 elif kind == "chat":
                     self.open_chat()
                     self.chat_append(f"[{time.strftime('%H:%M')}] {data[0]}: {data[1]}")
@@ -937,6 +1326,9 @@ class App:
                 rendezvous.publish(self.number, "", timeout=3)  # mark the number as offline
             except OSError:
                 pass
+        self.tray.stop()
+        self.instance.stop()
+        self.closed = True
         self.root.destroy()
 
 
@@ -981,12 +1373,33 @@ def selftest():
 def main():
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+    if WINDOWS:  # background service roles (winagent.py); no window
+        if "--service" in sys.argv:
+            sys.exit(winagent.run_service())
+        if "--agent" in sys.argv:
+            rest = sys.argv[sys.argv.index("--agent") + 1:]
+            sys.exit(winagent.run_agent(int(rest[0]) if rest and rest[0].isdigit() else None))
+        for flag, fn in (("--install-service", winagent.install_service),
+                         ("--uninstall-service", winagent.uninstall_service)):
+            if flag in sys.argv:  # used by the installer and uninstaller
+                try:
+                    fn()
+                    sys.exit(0)
+                except OSError as exc:
+                    winagent.log(f"{flag}: {exc}")
+                    sys.exit(1)
+        try:  # its own taskbar button and icon, not Python's (when run from source)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RemoteDesktop.App")
+        except (AttributeError, OSError):
+            pass
+    if "--restarted" not in sys.argv and "--share" not in sys.argv:
+        # Already running (perhaps hidden in the tray)? Bring that copy forward instead.
+        # At sign-in (--minimized) just leave the running copy alone.
+        if ask_running_copy("ping" if "--minimized" in sys.argv else "show"):
+            return
     root = tk.Tk()
-    try:
-        ttk.Style().theme_use("vista")
-    except tk.TclError:
-        pass
     App(root)
+
     root.mainloop()
 
 

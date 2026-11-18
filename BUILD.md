@@ -18,6 +18,34 @@ Put this folder in a GitHub repository and run the **Build installers** workflow
 (`.github/workflows/build.yml`) from the repository's Actions tab. It builds all
 three on GitHub's machines and offers them as downloads.
 
+## Releases and automatic updates
+
+1. Put this folder in a GitHub repository (public, so installed copies can read its Releases).
+2. Push a version tag: `git tag v1.2.0` then `git push origin v1.2.0`.
+3. The workflow builds all installers and publishes them as a GitHub Release, with
+   `SHA256SUMS-*.txt` checksum files. `version.py` is stamped with the tag's version
+   and the repository name, which is where installed copies look for updates.
+
+The app checks about once a day (and with **Check for updates**). It downloads the
+installer only after you agree, verifies its SHA-256 checksum against GitHub's, and on
+Windows installs it silently and restarts. For a local build, set `REPO` in `version.py`.
+
+## "Windows protected your PC" / "isn't commonly downloaded"
+
+Windows SmartScreen and Edge/Chrome warn about any program that is **not code-signed**
+or that few people have downloaded yet. Nothing in the program itself can turn this off;
+the fix is to sign it:
+
+- Get a code-signing certificate (for example Microsoft's Azure Trusted Signing, or an
+  OV certificate from a certificate authority).
+- Build with `-CertThumbprint <thumbprint>`, or set `SIGN_PFX` and `SIGN_PFX_PASSWORD`
+  (on GitHub: secrets `SIGN_PFX_BASE64` and `SIGN_PFX_PASSWORD`). Both the app and
+  `RemoteDesktopSetup.exe` are signed.
+
+Signed, the publisher name replaces "Unknown publisher". The warning itself fades as the
+signed installer builds up download reputation. Until then: click **More info** >
+**Run anyway**, and in the browser's downloads list choose **Keep**.
+
 ## Status
 
 - Windows: built and tested (install, run, uninstall).
@@ -30,9 +58,12 @@ Run `RemoteDesktop --selftest` on any system to repeat those checks.
 
 ## Platform notes
 
-- **Windows:** Remote control of UAC prompts and elevated windows (Task Manager, installers)
-  requires the app to run as Administrator and moves UAC prompts off the Secure Desktop.
-  Use `start.bat` (which auto-elevates) or run `fix_uac.bat` to disable the Secure Desktop.
+- **Windows:** the installer puts the app in Program Files and (unless unticked) installs
+  the **Remote Desktop Service**. Like RustDesk's, it runs as SYSTEM and keeps a small agent
+  in the signed-in user's session that captures and controls whichever desktop is active,
+  including UAC prompts on the secure desktop and the sign-in/lock screen. UAC stays fully
+  on. The agent only accepts the (administrator) Remote Desktop app, on this computer.
+  Elevated windows such as Task Manager also need the app itself to run as administrator.
 - **Linux:** controlling the computer needs an X11 session; Wayland blocks injected input.
 - **macOS:** the app is not code-signed, so open it the first time with right-click > Open.
   Allow it under System Settings > Privacy & Security > Screen Recording and > Accessibility.

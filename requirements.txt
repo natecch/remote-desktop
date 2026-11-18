@@ -4,3 +4,4 @@ websockets
 numpy
 dxcam; sys_platform == "win32"
 pynput; sys_platform != "win32"
+pystray; sys_platform != "darwin"
