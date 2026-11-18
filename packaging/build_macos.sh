@@ -27,6 +27,7 @@ pyinstaller --noconfirm --clean --windowed --name RemoteDesktop \
   --add-data "$ROOT/viewer.html:." --add-data "$ROOT/assets/icon-256.png:assets" \
   --add-binary "$ROOT/build/bin/cloudflared:bin" \
   --hidden-import mss.darwin --collect-submodules websockets --collect-submodules pynput \
+  --collect-data soundcard --hidden-import soundcard.coreaudio \
   --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin \
   --hidden-import pynput._util.darwin --hidden-import pynput._util.darwin_vks \
   --distpath "$ROOT/build/dist" --workpath "$ROOT/build/work" --specpath "$ROOT/build" app.py

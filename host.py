@@ -32,6 +32,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Response
 
+import audio
 import capture
 
 HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # also right when packaged
@@ -212,6 +213,7 @@ class Session:
         self.upload = None   # file currently being received from the viewer
         self.download = None  # task sending a file to the viewer
         self.io = inp         # mouse/keyboard/pointer: here, or through the agent
+        self.audio_task = None  # sends this computer's sound while the viewer has it on
 
 
 async def authenticate(ws, ip):
@@ -607,6 +609,43 @@ async def handle_files(ws, st, msg, monitors):
     return True
 
 
+AUDIO_QUEUE = 10  # 20 ms chunks waiting to be sent; beyond this, drop (keep latency low)
+
+
+async def set_audio(ws, st, on):
+    """Start or stop sending this computer's sound to one viewer."""
+    loop = asyncio.get_running_loop()
+    stop_audio(ws, st)
+    if not on:
+        return
+    problem = await loop.run_in_executor(None, audio.CAPTURE.problem)
+    if problem:
+        await ws.send(json.dumps({"t": "audio", "error": problem}))
+        return
+    chunks = asyncio.Queue()
+
+    def push(chunk):
+        if chunks.qsize() < AUDIO_QUEUE:
+            chunks.put_nowait(chunk)
+
+    async def sender():
+        while True:
+            chunk = await chunks.get()
+            await ws.send(b"\x03" + chunk)  # first byte 3 = sound
+
+    st.audio_task = asyncio.create_task(sender())
+    audio.CAPTURE.add(ws, lambda chunk: loop.call_soon_threadsafe(push, chunk))
+    await ws.send(json.dumps({"t": "audio", "rate": audio.RATE, "ch": audio.CHANNELS}))
+    log(f"{st.ip}: sound on")
+
+
+def stop_audio(ws, st):
+    audio.CAPTURE.remove(ws)
+    if st.audio_task:
+        st.audio_task.cancel()
+        st.audio_task = None
+
+
 MAX_CHAT = 2000
 CHAT_SINK = None  # the control panel sets this to receive (ip, text) chat messages
 
@@ -653,6 +692,8 @@ async def receive(ws, st, monitors):
                     st.fps = min(max(int(msg["fps"]), 1), 60)
                 st.frame = None  # send the whole picture again
                 st.wake.set()
+            elif t == "audio":  # sound on/off; allowed in view-only mode too
+                await set_audio(ws, st, bool(msg.get("on")))
             elif t == "chat":  # allowed in view-only mode too
                 text = str(msg["s"]).strip()[:MAX_CHAT]
                 if text and CHAT_SINK:
@@ -725,6 +766,7 @@ async def handler(ws):
         upload_abort(st)  # discard a half-received file
         cancel_download(st)
         drop_links(ws)
+        stop_audio(ws, st)
         SESSIONS.pop(ws, None)
         log(f"{ip}: disconnected")
 
