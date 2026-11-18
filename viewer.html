@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remote Desktop</title>
+<style>
+  :root { --bg:#0e1116; --panel:#171b22; --line:#2a303b; --text:#e6e9ef; --muted:#8b94a5; --accent:#4c8dff; --bad:#ff6b6b; --ok:#3ecf8e; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, "Segoe UI", sans-serif; display: flex; flex-direction: column; overflow: hidden; }
+  #bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  #bar .grow { flex: 1; }
+  #status { display: flex; align-items: center; gap: 6px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+  #dot.on { background: var(--ok); }
+  label { color: var(--muted); display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+  select, button, input, textarea { font: inherit; color: var(--text); background: #1f242d; border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; background: #000; }
+  #screen { max-width: 100%; max-height: 100%; display: block; outline: none; touch-action: none; }
+  #rcur { position: absolute; pointer-events: none; z-index: 3; line-height: 0; filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); }
+  #rcur[hidden] { display: none; }
+  #toast { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); background: rgba(23,27,34,.92); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; z-index: 5; pointer-events: none; }
+  #toast[hidden], #clipBtn[hidden] { display: none; }
+  #login { position: fixed; inset: 0; background: rgba(8,10,14,.92); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10; }
+  #login form { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 24px; width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 12px; }
+  #login h1 { font-size: 18px; margin: 0; }
+  #login input, #login button { padding: 8px 10px; }
+  #err { color: var(--bad); min-height: 1.4em; margin: 0; }
+  #keys { position: relative; }
+  #keymenu { position: absolute; top: calc(100% + 6px); right: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px; display: none; flex-direction: column; gap: 4px; z-index: 5; min-width: 170px; }
+  #keymenu.open { display: flex; }
+  #keymenu button { text-align: left; }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 12px; padding: 16px; width: min(520px, 92vw); }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+  dialog textarea { width: 100%; height: 160px; resize: vertical; }
+  dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+  :fullscreen #bar { display: none; }
+  #filesDlg h3 { font-size: 14px; margin: 14px 0 8px; }
+  #filesDlg .head { display: flex; justify-content: space-between; align-items: center; }
+  #filesDlg .hint, #filesDlg .status { color: var(--muted); font-size: 13px; }
+  #filesDlg .status { min-height: 1.4em; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #crumb { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  #curPath { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; flex: 1; }
+  #flist { border: 1px solid var(--line); border-radius: 8px; height: 220px; overflow: auto; }
+  #flist button { display: flex; gap: 8px; width: 100%; text-align: left; border: 0; border-radius: 0; background: none; padding: 5px 10px; }
+  #flist button:hover { background: #1f242d; }
+  #flist .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #flist .size { color: var(--muted); white-space: nowrap; }
+  #stage { position: relative; }
+  #chat { position: absolute; top: 0; right: 0; bottom: 0; width: min(320px, 90%); background: var(--panel); border-left: 1px solid var(--line); display: flex; flex-direction: column; z-index: 4; }
+  #chat[hidden] { display: none; }
+  #chat .head { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  #chatLog { flex: 1; overflow: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+  #chatLog .msg { max-width: 88%; background: #1f242d; border-radius: 10px; padding: 6px 10px; align-self: flex-start; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #chatLog .msg.me { align-self: flex-end; background: #244a8f; }
+  #chatLog .who { display: block; color: var(--muted); font-size: 11px; }
+  #chatLog .msg.me .who { color: #c5d6f5; }
+  #chatForm { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--line); }
+  #chatInput { flex: 1; min-width: 0; }
+  #stage.drop { outline: 3px dashed var(--accent); outline-offset: -6px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <div id="status"><span id="dot"></span><span id="stat">Disconnected</span></div>
+  <div class="grow"></div>
+  <label>Screen <select id="monitor"></select></label>
+  <label>Quality
+    <select id="quality">
+      <option value="35">Low</option><option value="60" selected>Medium</option>
+      <option value="80">High</option><option value="92">Best</option>
+    </select>
+  </label>
+  <label>Size
+    <select id="scale">
+      <option value="1" selected>100%</option><option value="0.75">75%</option>
+      <option value="0.5">50%</option><option value="0.35">35%</option>
+    </select>
+  </label>
+  <label>FPS
+    <select id="fps">
+      <option>10</option><option>15</option><option>30</option><option selected>60</option>
+    </select>
+  </label>
+  <div id="keys">
+    <button id="keysBtn" type="button">Send keys ▾</button>
+    <div id="keymenu">
+      <button data-combo="MetaLeft">Windows key</button>
+      <button data-combo="AltLeft,Tab">Alt + Tab</button>
+      <button data-combo="AltLeft,F4">Alt + F4</button>
+      <button data-combo="MetaLeft,KeyD">Show desktop</button>
+      <button data-combo="MetaLeft,KeyL">Lock PC</button>
+      <button data-combo="ControlLeft,ShiftLeft,Escape">Task Manager</button>
+      <button data-combo="PrintScreen">Print Screen</button>
+    </div>
+  </div>
+  <button id="pasteBtn" type="button">Type text…</button>
+  <button id="filesBtn" type="button">Files…</button>
+  <button id="chatBtn" type="button">Chat</button>
+  <button id="clipBtn" type="button" class="primary" hidden>Copy remote clipboard</button>
+  <button id="fsBtn" type="button">Fullscreen</button>
+  <button id="discBtn" type="button">Disconnect</button>
+</div>
+
+<div id="stage">
+  <canvas id="screen" tabindex="0" width="16" height="9"></canvas>
+  <div id="rcur" hidden><svg width="18" height="26" viewBox="0 0 18 26"><path d="M1 1v19.5l5-4.6 3.7 8.8 3.2-1.4-3.7-8.6H16z" fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/></svg></div>
+  <div id="toast" hidden></div>
+  <aside id="chat" hidden>
+    <div class="head"><strong>Chat</strong><button id="chatClose" type="button">✕</button></div>
+    <div id="chatLog"></div>
+    <form id="chatForm">
+      <input id="chatInput" maxlength="2000" placeholder="Type a message…" autocomplete="off">
+      <button class="primary" type="submit">Send</button>
+    </form>
+  </aside>
+</div>
+
+<div id="login">
+  <form id="loginForm">
+    <h1>Remote Desktop</h1>
+    <input id="pw" type="password" placeholder="Password" autocomplete="current-password" autofocus>
+    <button class="primary" type="submit">Connect</button>
+    <p id="err"></p>
+  </form>
+</div>
+
+<dialog id="pasteDlg">
+  <form method="dialog">
+    <div style="margin-bottom:8px">Text to type on the remote computer:</div>
+    <textarea id="pasteText"></textarea>
+    <div class="row">
+      <button value="cancel">Cancel</button>
+      <button class="primary" value="send">Type it</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="filesDlg">
+  <div class="head"><strong>File transfer</strong><button id="filesClose" type="button">Close</button></div>
+  <h3>Send to the remote computer</h3>
+  <input type="file" id="upPick" multiple hidden>
+  <button id="upBtn" type="button">Choose files…</button>
+  <span class="hint">or drag files onto the remote screen. They are saved in Downloads\Remote Desktop.</span>
+  <div class="status" id="upStatus"></div>
+  <h3>Get from the remote computer</h3>
+  <div id="crumb"><button id="upDir" type="button">↑ Up</button><span id="curPath"></span></div>
+  <div id="flist"></div>
+  <div class="status" id="dlStatus">Click a file to download it.</div>
+</dialog>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const canvas = $("screen"), ctx = canvas.getContext("2d");
+let ws = null, ready = false, viewOnly = false;
+let frames = 0, bytes = 0, hostName = "";
+let wsTarget = null;  // set when the desktop app opens this page to control another computer
+
+// ---- HMAC-SHA256 in plain JS (crypto.subtle is unavailable on plain http://LAN) ----
+function sha256(msg) {
+  const K = [], H = [];
+  for (let n = 2, i = 0; i < 64; n++) {
+    let prime = true;
+    for (let d = 2; d * d <= n; d++) if (n % d === 0) { prime = false; break; }
+    if (prime) {
+      if (i < 8) H[i] = (Math.pow(n, 0.5) % 1 * 4294967296) | 0;
+      K[i++] = (Math.pow(n, 1 / 3) % 1 * 4294967296) | 0;
+    }
+  }
+  const len = msg.length, total = ((len + 9 + 63) >> 6) << 6;
+  const buf = new Uint8Array(total);
+  buf.set(msg); buf[len] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(total - 8, Math.floor(len / 536870912));
+  dv.setUint32(total - 4, (len << 3) >>> 0);
+  const w = new Int32Array(64);
+  for (let o = 0; o < total; o += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getInt32(o + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const x = w[i - 15], y = w[i - 2];
+      const s0 = (x >>> 7 | x << 25) ^ (x >>> 18 | x << 14) ^ (x >>> 3);
+      const s1 = (y >>> 17 | y << 15) ^ (y >>> 19 | y << 13) ^ (y >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = (e >>> 6 | e << 26) ^ (e >>> 11 | e << 21) ^ (e >>> 25 | e << 7);
+      const t1 = (h + S1 + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;
+      const S0 = (a >>> 2 | a << 30) ^ (a >>> 13 | a << 19) ^ (a >>> 22 | a << 10);
+      const t2 = (S0 + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    [a, b, c, d, e, f, g, h].forEach((v, i) => H[i] = (H[i] + v) | 0);
+  }
+  const out = new Uint8Array(32), odv = new DataView(out.buffer);
+  H.forEach((v, i) => odv.setInt32(i * 4, v));
+  return out;
+}
+function hmacHex(keyStr, msgStr) {
+  const enc = new TextEncoder();
+  let key = enc.encode(keyStr);
+  if (key.length > 64) key = sha256(key);
+  const ipad = new Uint8Array(64).fill(0x36), opad = new Uint8Array(64).fill(0x5c);
+  key.forEach((v, i) => { ipad[i] ^= v; opad[i] ^= v; });
+  const cat = (a, b) => { const r = new Uint8Array(a.length + b.length); r.set(a); r.set(b, a.length); return r; };
+  const mac = sha256(cat(opad, sha256(cat(ipad, enc.encode(msgStr)))));
+  return Array.from(mac, v => v.toString(16).padStart(2, "0")).join("");
+}
+
+// ---- connection ----
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+const canControl = () => ready && !viewOnly;
+
+function connect(password) {
+  $("err").textContent = "Connecting…";
+  let denied = false, busy = false, timedOut = false;
+  // Never sit on "Connecting…" for ever: give up if the remote computer has not answered.
+  const giveUp = setTimeout(() => { if (ws === sock && !ready) { timedOut = true; sock.close(); } }, 15000);
+  const sock = new WebSocket(wsTarget || ((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"));
+  sock.binaryType = "arraybuffer";
+  ws = sock;
+  sock.onmessage = async ev => {
+    if (typeof ev.data === "string") {
+      const m = JSON.parse(ev.data);
+      if (m.t === "hello") sock.send(JSON.stringify({ t: "auth", mac: hmacHex(password, m.nonce) }));
+      else if (m.t === "denied") denied = true;
+      else if (m.t === "busy") busy = true;
+      else if (m.t === "ready") { clearTimeout(giveUp); onReady(m); }
+      else if (m.t === "cur") { remoteCur = m; updateCursor(); }
+      else if (m.t === "clip") onClip(String(m.s));
+      else if (m.t === "chat") onChat(m);
+      else onFileMsg(m);
+      return;
+    }
+    bytes += ev.data.byteLength;
+    const kind = new Uint8Array(ev.data, 0, 1)[0];
+    if (kind === 1) onFileChunk(new Uint8Array(ev.data, 1));
+    else if (kind === 2) onScreen(ev.data, sock);
+  };
+  sock.onclose = ev => {
+    clearTimeout(giveUp);
+    if (ws !== sock) return;
+    const wasReady = ready;
+    ws = null; ready = false; remoteCur = null;
+    updateCursor();
+    transferReset();
+    $("dot").classList.remove("on");
+    $("stat").textContent = "Disconnected";
+    canvas.classList.remove("control");
+    $("login").style.display = "flex";
+    $("err").textContent = denied ? "Wrong password."
+      : busy ? "The remote computer's screen is not available right now. Try again in a moment."
+      : timedOut ? "The remote computer did not respond. Check that it is on and sharing, then try again."
+      : ev.reason === "locked out" ? "Too many attempts. Try again in a minute."
+      : wasReady ? "Connection closed." : "Could not connect to the host.";
+    $("pw").focus();
+  };
+}
+
+// A screen update holds only the regions that changed: width u16, height u16, count u8, then
+// per region x u16, y u16, length u32 and a JPEG. Decoding starts at once, but regions are
+// drawn strictly in arrival order so an older picture can never overwrite a newer one.
+let drawChain = Promise.resolve();
+function onScreen(buf, sock) {
+  const dv = new DataView(buf);
+  const width = dv.getUint16(1, true), height = dv.getUint16(3, true), count = dv.getUint8(5);
+  const regions = [];
+  for (let i = 0, o = 6; i < count; i++) {
+    const x = dv.getUint16(o, true), y = dv.getUint16(o + 2, true), len = dv.getUint32(o + 4, true);
+    o += 8;
+    regions.push({ x, y, bmp: createImageBitmap(new Blob([new Uint8Array(buf, o, len)], { type: "image/jpeg" })) });
+    o += len;
+  }
+  drawChain = drawChain.then(async () => {
+    try {
+      if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; updateCursor(); }
+      for (const r of regions) { const bmp = await r.bmp; ctx.drawImage(bmp, r.x, r.y); bmp.close(); }
+      frames++;
+    } catch (e) {
+    } finally {
+      if (sock.readyState === 1) sock.send('{"t":"ack"}');
+    }
+  });
+}
+
+// ---- clipboard: text copied on the remote computer lands in this computer's clipboard ----
+let lastClip = null, pendingClip = null;
+function toast(text) {
+  const el = $("toast");
+  el.textContent = text; el.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { el.hidden = true; }, 2500);
+}
+async function onClip(text) {
+  lastClip = text;
+  try {
+    await navigator.clipboard.writeText(text);
+    pendingClip = null; $("clipBtn").hidden = true;
+    toast("Copied from the remote computer");
+  } catch (e) {  // no permission, or a plain-http page: offer a button instead
+    pendingClip = text; $("clipBtn").hidden = false;
+  }
+}
+function copyPendingClip() {
+  if (pendingClip === null) return;
+  const box = document.createElement("textarea");
+  box.value = pendingClip; box.style.position = "fixed"; box.style.opacity = "0";
+  document.body.append(box); box.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) {}
+  box.remove();
+  if (ok) { pendingClip = null; $("clipBtn").hidden = true; toast("Copied from the remote computer"); }
+  canvas.focus();
+}
+// If the browser refused the automatic copy (window not focused), try again as soon as it is used.
+async function flushClip() {
+  if (pendingClip === null || !navigator.clipboard || !navigator.clipboard.writeText) return;
+  try {
+    await navigator.clipboard.writeText(pendingClip);
+    pendingClip = null; $("clipBtn").hidden = true;
+    toast("Copied from the remote computer");
+  } catch (e) {}
+}
+window.addEventListener("focus", flushClip);
+window.addEventListener("pointerdown", flushClip, true);
+
+// Before a paste keystroke is sent, hand this computer's clipboard text to the remote one.
+async function pushClipboard() {
+  if (!navigator.clipboard || !navigator.clipboard.readText) return;
+  try {
+    const text = await Promise.race([navigator.clipboard.readText(), new Promise(r => setTimeout(() => r(null), 400))]);
+    if (text && text !== lastClip && text.length <= 200000) { lastClip = text; send({ t: "clip", s: text }); }
+  } catch (e) {}
+}
+
+function onReady(m) {
+  ready = true; viewOnly = m.viewOnly; hostName = m.host;
+  document.title = m.host + " – Remote Desktop";
+  $("login").style.display = "none";
+  $("pw").value = ""; $("err").textContent = "";
+  $("dot").classList.add("on");
+  canvas.classList.toggle("control", !viewOnly);
+  $("filesBtn").hidden = viewOnly;
+  const sel = $("monitor");
+  sel.innerHTML = "";
+  m.monitors.forEach((mon, i) => sel.add(new Option(`${i + 1} (${mon.w}×${mon.h})`, i)));
+  sendConfig();
+  canvas.focus();
+}
+
+function sendConfig() {
+  send({ t: "cfg", monitor: +$("monitor").value, quality: +$("quality").value, scale: +$("scale").value, fps: +$("fps").value });
+}
+
+setInterval(() => {
+  if (ready) $("stat").textContent = `${hostName}${viewOnly ? " (view only)" : ""} · ${frames} fps · ${(bytes / 1024).toFixed(0)} KB/s`;
+  frames = 0; bytes = 0;
+}, 1000);
+
+// ---- toolbar ----
+$("loginForm").addEventListener("submit", e => { e.preventDefault(); if (!ws) connect($("pw").value); });
+for (const id of ["monitor", "quality", "scale", "fps"])
+  $(id).addEventListener("change", e => { sendConfig(); e.target.blur(); canvas.focus(); });
+$("discBtn").addEventListener("click", () => { if (ws) ws.close(); });
+$("fsBtn").addEventListener("click", async () => {
+  await document.documentElement.requestFullscreen();
+  // In fullscreen, capture system shortcuts (Alt+Tab, Win, Esc) where the browser allows it.
+  if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(() => {});
+  canvas.focus();
+});
+$("keysBtn").addEventListener("click", e => { e.stopPropagation(); $("keymenu").classList.toggle("open"); });
+document.addEventListener("click", () => $("keymenu").classList.remove("open"));
+$("keymenu").addEventListener("click", e => {
+  const combo = e.target.dataset.combo;
+  if (!combo || !canControl()) return;
+  const codes = combo.split(",");
+  codes.forEach(c => send({ t: "k", c, down: true }));
+  codes.reverse().forEach(c => send({ t: "k", c, down: false }));
+  canvas.focus();
+});
+$("pasteBtn").addEventListener("click", () => { $("pasteText").value = ""; $("pasteDlg").showModal(); });
+$("pasteDlg").addEventListener("close", () => {
+  if ($("pasteDlg").returnValue === "send" && canControl() && $("pasteText").value) send({ t: "text", s: $("pasteText").value });
+  canvas.focus();
+});
+
+// ---- chat ----
+let unread = 0;
+function addChat(who, text, mine) {
+  const msg = document.createElement("div"), label = document.createElement("span"), body = document.createElement("div");
+  msg.className = "msg" + (mine ? " me" : "");
+  label.className = "who";
+  label.textContent = who + " · " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  body.textContent = text;   // textContent: messages are untrusted
+  msg.append(label, body);
+  $("chatLog").append(msg);
+  $("chatLog").scrollTop = $("chatLog").scrollHeight;
+}
+function showChat(open) {
+  $("chat").hidden = !open;
+  if (open) { unread = 0; $("chatInput").focus(); $("chatLog").scrollTop = $("chatLog").scrollHeight; }
+  else canvas.focus();
+  $("chatBtn").textContent = unread ? `Chat (${unread})` : "Chat";
+}
+function onChat(m) {
+  addChat("Remote computer", String(m.s), false);
+  if ($("chat").hidden) { unread++; $("chatBtn").textContent = `Chat (${unread})`; }
+}
+$("chatBtn").addEventListener("click", () => showChat($("chat").hidden));
+$("chatClose").addEventListener("click", () => showChat(false));
+$("chatForm").addEventListener("submit", e => {
+  e.preventDefault();
+  const text = $("chatInput").value.trim();
+  if (!text || !ready) return;
+  send({ t: "chat", s: text });
+  addChat("You", text, true);
+  $("chatInput").value = "";
+});
+
+// ---- file transfer ----
+const CHUNK = 256 * 1024;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const fmtSize = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB"
+  : n < 1073741824 ? (n / 1048576).toFixed(1) + " MB" : (n / 1073741824).toFixed(2) + " GB";
+let xferId = 0, waiters = {}, uploading = false, upErr = null, dl = null, curParent = null, curPath = "";
+const waitFor = id => new Promise(resolve => { waiters[id] = resolve; });
+
+function transferReset() {
+  Object.values(waiters).forEach(resolve => resolve({ t: "up_err", msg: "connection lost" }));
+  waiters = {};
+  if (dl) $("dlStatus").textContent = `Download of ${dl.name} failed: connection lost.`;
+  dl = null;
+  if ($("filesDlg").open) $("filesDlg").close();
+}
+
+async function uploadFiles(fileList) {
+  const files = [...fileList];
+  if (!canControl() || uploading || !files.length) return;
+  uploading = true;
+  if (!$("filesDlg").open) openFiles();
+  const done = [];
+  const show = line => { $("upStatus").textContent = [...done, line].filter(Boolean).join("\n"); };
+  for (const file of files) {
+    const id = ++xferId, sock = ws;
+    let failed = null;
+    upErr = null;
+    show(`Sending ${file.name}…`);
+    send({ t: "up_start", id, name: file.name, size: file.size });
+    let r = await waitFor(id);
+    if (r.t !== "up_ready") failed = r.msg;
+    try {
+      for (let o = 0; !failed && o < file.size; o += CHUNK) {
+        if (ws !== sock || sock.readyState !== 1) { failed = "connection lost"; break; }
+        if (upErr) { failed = upErr; break; }
+        sock.send(await file.slice(o, o + CHUNK).arrayBuffer());
+        while (sock.bufferedAmount > 4 * CHUNK && sock.readyState === 1) await sleep(15);
+        show(`Sending ${file.name}… ${Math.round(Math.min(o + CHUNK, file.size) / file.size * 100)}%`);
+      }
+    } catch (e) {
+      failed = "could not read the file (folders cannot be sent)";
+      send({ t: "up_cancel" });
+    }
+    if (!failed) {
+      send({ t: "up_end", id });
+      r = await waitFor(id);
+      if (r.t !== "up_ok") failed = r.msg;
+    }
+    done.push(failed ? `✗ ${file.name}: ${failed}` : `✓ ${r.name} (${fmtSize(file.size)}) sent`);
+    show("");
+  }
+  uploading = false;
+  if (canControl()) send({ t: "ls", path: curPath });  // refresh the listing
+}
+
+function onFileMsg(m) {
+  if (m.t === "up_ready" || m.t === "up_ok" || m.t === "up_err") {
+    if (waiters[m.id]) { waiters[m.id](m); delete waiters[m.id]; }
+    else if (m.t === "up_err") upErr = m.msg;
+  } else if (m.t === "ls") renderListing(m);
+  else if (m.t === "ls_err") $("dlStatus").textContent = "Cannot open that folder: " + m.msg;
+  else if (m.t === "file_start") dl = { id: m.id, name: m.name, size: m.size, parts: [], got: 0 };
+  else if (m.t === "file_err") { dl = null; $("dlStatus").textContent = "Download failed: " + m.msg; }
+  else if (m.t === "file_end" && dl && dl.id === m.id) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob(dl.parts));
+    a.download = dl.name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    $("dlStatus").textContent = `✓ ${dl.name} (${fmtSize(dl.size)}) downloaded`;
+    dl = null;
+  }
+}
+
+function onFileChunk(data) {
+  if (!dl) return;
+  dl.parts.push(data);
+  dl.got += data.length;
+  $("dlStatus").textContent = `Downloading ${dl.name}… ${dl.size ? Math.round(dl.got / dl.size * 100) : 100}%`;
+}
+
+function renderListing(m) {
+  curParent = m.parent;
+  curPath = m.path;
+  $("curPath").textContent = m.path || "This computer";
+  $("upDir").disabled = m.parent === null;
+  const list = $("flist");
+  list.textContent = "";
+  for (const e of m.entries) {
+    const row = document.createElement("button");
+    row.type = "button";
+    const name = document.createElement("span"), size = document.createElement("span");
+    name.className = "name"; size.className = "size";
+    name.textContent = (e.d ? "📁 " : "📄 ") + e.n;   // textContent: file names are untrusted
+    size.textContent = e.d ? "" : fmtSize(e.s);
+    row.append(name, size);
+    row.addEventListener("click", () => {
+      if (e.d) return send({ t: "ls", path: e.p });
+      if (dl) { $("dlStatus").textContent = `Wait for ${dl.name} to finish first.`; return; }
+      $("dlStatus").textContent = `Requesting ${e.n}…`;
+      send({ t: "get", id: ++xferId, path: e.p });
+    });
+    list.append(row);
+  }
+  if (!m.entries.length) list.textContent = "(empty folder)";
+  list.scrollTop = 0;
+}
+
+function openFiles() {
+  if (!canControl()) return;
+  $("filesDlg").showModal();
+  if (!$("flist").childNodes.length) send({ t: "ls", path: "" });
+}
+$("filesBtn").addEventListener("click", openFiles);
+$("filesClose").addEventListener("click", () => { $("filesDlg").close(); canvas.focus(); });
+$("upDir").addEventListener("click", () => { if (curParent !== null) send({ t: "ls", path: curParent }); });
+$("upBtn").addEventListener("click", () => $("upPick").click());
+$("upPick").addEventListener("change", e => { uploadFiles(e.target.files); e.target.value = ""; });
+for (const target of [$("stage"), $("filesDlg")]) {
+  target.addEventListener("dragover", e => { if (canControl()) { e.preventDefault(); $("stage").classList.add("drop"); } });
+  target.addEventListener("dragleave", () => $("stage").classList.remove("drop"));
+  target.addEventListener("drop", e => {
+    e.preventDefault();
+    $("stage").classList.remove("drop");
+    uploadFiles(e.dataTransfer.files);
+  });
+}
+
+// ---- mouse ----
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+}
+let pendingMove = null;
+
+// The picture contains no pointer, so the host reports it. When you are in control, your own
+// pointer takes the remote pointer's shape; the drawn arrow appears when you are only watching,
+// or when someone at the remote computer moves the mouse.
+let remoteCur = null, lastLocal = null, lastLocalAt = 0, localOver = false;
+function updateCursor() {
+  const m = remoteCur, arrow = $("rcur");
+  canvas.style.cursor = canControl() && m ? m.c : "default";
+  let show = ready && !!m && m.v && m.x >= 0 && m.x <= 1 && m.y >= 0 && m.y <= 1;
+  if (show && !viewOnly && localOver) {
+    const idle = performance.now() - lastLocalAt > 700;
+    const apart = !lastLocal || Math.hypot(m.x - lastLocal.x, m.y - lastLocal.y) > 0.02;
+    show = idle && apart;
+  }
+  arrow.hidden = !show;
+  if (!show) return;
+  const r = canvas.getBoundingClientRect(), s = $("stage").getBoundingClientRect();
+  arrow.style.left = (r.left - s.left + m.x * r.width) + "px";
+  arrow.style.top = (r.top - s.top + m.y * r.height) + "px";
+}
+canvas.addEventListener("pointerenter", () => { localOver = true; updateCursor(); });
+canvas.addEventListener("pointerleave", () => { localOver = false; updateCursor(); });
+window.addEventListener("resize", updateCursor);
+
+function flushMove() { if (pendingMove) { send({ t: "m", ...pendingMove }); pendingMove = null; } }
+canvas.addEventListener("pointermove", e => {
+  if (!canControl()) return;
+  if (!pendingMove) requestAnimationFrame(flushMove);
+  pendingMove = lastLocal = pos(e);
+  lastLocalAt = performance.now();
+  if (!$("rcur").hidden) updateCursor();
+});
+canvas.addEventListener("pointerdown", e => {
+  if (!canControl()) return;
+  e.preventDefault(); canvas.focus(); canvas.setPointerCapture(e.pointerId);
+  pendingMove = null;
+  send({ t: "d", b: e.button, ...pos(e) });
+});
+canvas.addEventListener("pointerup", e => {
+  if (!canControl()) return;
+  e.preventDefault(); pendingMove = null;
+  send({ t: "u", b: e.button, ...pos(e) });
+});
+canvas.addEventListener("wheel", e => {
+  if (!canControl()) return;
+  e.preventDefault();
+  const k = e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 800 : 1;
+  send({ t: "w", dx: e.deltaX * k, dy: e.deltaY * k });
+}, { passive: false });
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+canvas.addEventListener("auxclick", e => e.preventDefault());
+
+// ---- keyboard ----
+function keyHandler(down) {
+  return e => {
+    if (!canControl() || document.querySelector("dialog[open]")) return;
+    if (e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return;
+    e.preventDefault();
+    if (!e.code) return;
+    const code = e.code, paste = down && code === "KeyV" && (e.ctrlKey || e.metaKey) && !e.repeat;
+    // Keys go out in order even when a paste first has to hand over the clipboard.
+    keyChain = keyChain.then(async () => {
+      if (paste) await pushClipboard();
+      send({ t: "k", c: code, down });
+    });
+  };
+}
+let keyChain = Promise.resolve();
+$("clipBtn").addEventListener("click", copyPendingClip);
+window.addEventListener("keydown", keyHandler(true));
+window.addEventListener("keyup", keyHandler(false));
+window.addEventListener("blur", () => send({ t: "rel" }));  // release held keys when focus leaves
+
+// ---- opened by the desktop app: collect the target address (and password) once ----
+(async () => {
+  const validTarget = t => typeof t === "string" && /^wss?:\/\/[a-z0-9.:-]+\/ws$/.test(t);
+  const token = new URLSearchParams(location.search).get("s");
+  try { const kept = sessionStorage.getItem("rd_target"); if (validTarget(kept)) wsTarget = kept; } catch (e) {}
+  if (!token) return;
+  history.replaceState(null, "", location.pathname);
+  try {
+    const res = await fetch("/session/" + encodeURIComponent(token));
+    if (!res.ok) throw new Error("expired");
+    const session = await res.json();
+    if (!validTarget(session.ws)) throw new Error("bad target");
+    wsTarget = session.ws;
+    try { sessionStorage.setItem("rd_target", wsTarget); } catch (e) {}  // survives a reload; the password is not kept
+    if (session.password && !ws) connect(session.password);
+  } catch (e) {
+    if (!wsTarget) $("err").textContent = "This window has expired. Close it and connect again from the app.";
+  }
+})();
+</script>
+</body>
+</html>

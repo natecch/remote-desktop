@@ -1,0 +1,43 @@
+# Builds the Linux and macOS installers on GitHub's machines (Windows is built locally
+# with packaging\build_windows.ps1; its job here runs only for version tags).
+# Run it from the Actions tab, or push a tag like v1.0.0. Installers appear as artifacts.
+name: Build installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: sudo apt-get update && sudo apt-get install -y python3-tk python3-dev dpkg-dev curl
+      - run: bash packaging/build_linux.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: linux-installer, path: build/installer/* }
+
+  macos:
+    runs-on: macos-latest   # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: bash packaging/build_macos.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: macos-installer, path: build/installer/*.dmg }
+
+  windows:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: choco install innosetup -y --no-progress
+      - run: powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1 -Python python
+      - uses: actions/upload-artifact@v4
+        with: { name: windows-installer, path: build/installer/*.exe }

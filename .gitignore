@@ -1,0 +1,9 @@
+# Personal settings: your ID and (encrypted) password. Never commit.
+settings.json
+
+# Local environment and build output
+.venv/
+build/
+__pycache__/
+*.pyc
+*.spec

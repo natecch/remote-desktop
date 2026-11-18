@@ -1,0 +1,9 @@
+# Shell scripts and the workflow run on Linux/macOS: keep LF line endings.
+*.sh  text eol=lf
+*.yml text eol=lf
+# Batch files run on Windows: keep CRLF.
+*.bat text eol=crlf
+# Binary assets
+*.png binary
+*.ico binary
+*.icns binary
