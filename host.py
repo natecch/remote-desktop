@@ -214,6 +214,7 @@ class Session:
         self.download = None  # task sending a file to the viewer
         self.io = inp         # mouse/keyboard/pointer: here, or through the agent
         self.audio_task = None  # sends this computer's sound while the viewer has it on
+        self.paste_files = []   # files the viewer sent to paste here (Ctrl+V of files copied there)
 
 
 async def authenticate(ws, ip):
@@ -287,6 +288,10 @@ async def stream(ws, st, monitors):
                 if text and text != st.clip_text and len(text) <= MAX_CLIP:
                     st.clip_text = text
                     await ws.send(json.dumps({"t": "clip", "s": text}))
+                elif not text:
+                    offer = clipboard_offer(ws)
+                    if offer:  # files copied here: the viewer's app can fetch them for its clipboard
+                        await ws.send(json.dumps({"t": "clipfiles", "files": offer}))
         cursor = await asyncio.get_running_loop().run_in_executor(None, st.io.cursor_info) \
             if st.io is not inp else inp.cursor_info()  # the picture has no pointer in it, so report it separately
         if cursor:
@@ -429,7 +434,7 @@ def upload_start(st, msg):
         if 0 <= x <= 1 and 0 <= y <= 1:
             at = (x, y)
     st.upload = {"id": msg["id"], "name": safe_name(msg["name"]), "size": size, "got": 0,
-                 "tmp": tmp, "f": open(tmp, "wb"), "at": at}
+                 "tmp": tmp, "f": open(tmp, "wb"), "at": at, "clip": bool(msg.get("clip"))}
 
 
 def upload_chunk(st, data):
@@ -448,9 +453,56 @@ def upload_finish(st):
         raise OSError("Transfer incomplete")
     st.upload = None
     up["f"].close()
+    if up.get("clip"):  # for pasting: kept aside until the paste, not in Received files
+        folder = paste_folder(st)
+        final = unique_path(folder, up["name"])
+        shutil.move(str(up["tmp"]), str(final))
+        st.paste_files.append(final)
+        return final
     final = unique_path(RECEIVED_DIR, up["name"])
     up["tmp"].replace(final)
     return final
+
+
+PASTE_ROOT = Path(os.environ.get("TEMP") or "/tmp") / "RemoteDesktopPaste"
+
+
+def paste_folder(st):
+    """A fresh folder for one paste; folders from earlier days are cleared away."""
+    PASTE_ROOT.mkdir(parents=True, exist_ok=True)
+    for old in PASTE_ROOT.iterdir():
+        try:
+            if time.time() - old.stat().st_mtime > 86400:
+                shutil.rmtree(old, ignore_errors=True)
+        except OSError:
+            pass
+    if not st.paste_files:
+        st.paste_dir = PASTE_ROOT / secrets.token_hex(6)
+        st.paste_dir.mkdir()
+    return st.paste_dir
+
+
+CLIP_MAX_FILES = 50
+
+
+def clipboard_offer(ws):
+    """Files copied on this computer, as download links for the viewer, or None."""
+    paths = getattr(inp, "clipboard_files", lambda: None)()
+    if not paths:
+        return None
+    offer, now = [], time.monotonic()
+    for path in paths[:CLIP_MAX_FILES]:
+        target = Path(path)
+        try:
+            if not target.is_file() or target.stat().st_size > LINK_MAX:
+                continue  # folders and very large files: use the Files panel instead
+            size = target.stat().st_size
+        except OSError:
+            continue
+        token = secrets.token_urlsafe(18)
+        LINKS[token] = {"path": str(target), "ws": ws, "expires": now + LINK_SECONDS}
+        offer.append({"n": target.name, "s": size, "u": "/dl/" + token})
+    return offer or None
 
 
 async def place_dropped(st, final, at, monitors):
@@ -590,8 +642,11 @@ async def handle_files(ws, st, msg, monitors):
     elif t == "up_end":
         if st.upload and st.upload["id"] == mid:
             try:
-                size, at = st.upload["size"], st.upload["at"]
+                size, at, clip = st.upload["size"], st.upload["at"], st.upload.get("clip")
                 final = upload_finish(st)
+                if clip:
+                    await reply(t="up_ok", id=mid, name=final.name, where="the clipboard")
+                    return True
                 final, where = await place_dropped(st, final, at, monitors)
                 log(f"{st.ip}: sent file {final.name} ({fmt_size(size)}) -> {where or final.parent}")
                 await reply(t="up_ok", id=mid, name=final.name, where=where or "Received files")
@@ -599,6 +654,14 @@ async def handle_files(ws, st, msg, monitors):
                 await reply(t="up_err", id=mid, msg=exc.strerror or str(exc))
     elif t == "up_cancel":
         upload_abort(st)
+    elif t == "clipset":  # the files sent for a paste are complete: put them on this clipboard
+        files, st.paste_files = st.paste_files, []
+        ok = bool(files) and drop_target is not None and await asyncio.get_running_loop().run_in_executor(
+            None, drop_target.put_files_on_clipboard, files, False)
+        st.clip_seq = inp.clipboard_seq()  # not something to offer back to the viewer
+        if ok:
+            log(f"{st.ip}: pasted {len(files)} file(s) via the clipboard")
+        await reply(t="clipset", ok=bool(ok), n=len(files))
     elif t == "get":
         cancel_download(st)
         st.download = asyncio.create_task(send_file(ws, st, str(msg["path"]), mid))
@@ -646,6 +709,22 @@ def stop_audio(ws, st):
         st.audio_task = None
 
 
+def restart_computer():
+    """Restart this computer (asked for by a viewer with full control)."""
+    import subprocess
+    if sys.platform == "win32":
+        cmd = ["shutdown", "/r", "/t", "5", "/c", "Restarted remotely with Remote Desktop."]
+    elif sys.platform == "darwin":
+        cmd = ["osascript", "-e", 'tell application "System Events" to restart']
+    else:
+        cmd = ["systemctl", "reboot"]
+    try:
+        subprocess.run(cmd, timeout=20, capture_output=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"Could not restart: {exc}")
+
+
 MAX_CHAT = 2000
 CHAT_SINK = None  # the control panel sets this to receive (ip, text) chat messages
 
@@ -680,6 +759,12 @@ async def receive(ws, st, monitors):
             if t == "ack":
                 st.pending = max(0, st.pending - 1)
                 st.wake.set()
+            elif t == "ping":  # the viewer measures the round trip (shown as a quality badge)
+                await ws.send(json.dumps({"t": "pong", "c": msg.get("c")}))
+            elif t == "restart" and not VIEW_ONLY:
+                log(f"{st.ip}: restarting this computer")
+                await ws.send(json.dumps({"t": "restarting"}))
+                await asyncio.get_running_loop().run_in_executor(None, restart_computer)
             elif t == "cfg":
                 st.cursor = None  # resend the pointer for the newly selected screen
                 if "monitor" in msg:

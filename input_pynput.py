@@ -150,3 +150,8 @@ def clipboard_set(text):
     if ok:
         _clip["text"] = text
     return ok
+
+
+def clipboard_files():
+    """Copying files between computers through the clipboard is Windows-only for now."""
+    return None

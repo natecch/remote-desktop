@@ -289,3 +289,33 @@ def clipboard_set(text):
         return True  # the system owns the memory now
     finally:
         user32.CloseClipboard()
+
+
+# --------------------------------------------------------------------------
+# Files on the clipboard (copied in Explorer): copy/paste files between computers
+# --------------------------------------------------------------------------
+
+CF_HDROP = 15
+shell32 = ctypes.WinDLL("shell32")
+shell32.DragQueryFileW.argtypes = (ctypes.c_void_p, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT)
+shell32.DragQueryFileW.restype = wintypes.UINT
+
+
+def clipboard_files():
+    """Paths of files copied to the clipboard (Explorer's Ctrl+C), or None."""
+    if not user32.IsClipboardFormatAvailable(CF_HDROP) or not _open_clipboard():
+        return None
+    try:
+        handle = user32.GetClipboardData(CF_HDROP)
+        if not handle:
+            return None
+        count = shell32.DragQueryFileW(handle, 0xFFFFFFFF, None, 0)
+        paths = []
+        for i in range(min(count, 1000)):
+            length = shell32.DragQueryFileW(handle, i, None, 0)
+            buf = ctypes.create_unicode_buffer(length + 1)
+            shell32.DragQueryFileW(handle, i, buf, length + 1)
+            paths.append(buf.value)
+        return paths
+    finally:
+        user32.CloseClipboard()

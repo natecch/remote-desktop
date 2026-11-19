@@ -170,6 +170,24 @@ class Theme:
         if self.on_change:
             self.on_change()
 
+    def _restyle_popdowns(self):
+        """Lists of drop-downs that were already opened keep their colours; recolour them."""
+        p = self.pal
+        for box in getattr(self, "comboboxes", []):
+            try:
+                pop = box.tk.call("ttk::combobox::PopdownWindow", box)
+                box.tk.call(f"{pop}.f.l", "configure", "-background", p["field"], "-foreground", p["text"],
+                            "-selectbackground", p["accent"], "-selectforeground", "#ffffff")
+            except tk.TclError:
+                pass
+
+    def combobox(self, box):
+        """Register a drop-down so its list follows light/dark changes."""
+        if not hasattr(self, "comboboxes"):
+            self.comboboxes = []
+        self.comboboxes.append(box)
+        return box
+
     def _checkbox_images(self):
         """Rounded checkboxes with a tick, drawn for the current mode (clam's own shows an X)."""
         try:
@@ -255,6 +273,24 @@ class Theme:
                            ("readonly", p["field_border"])],
               lightcolor=[("focus", "!readonly", p["accent"]), ("!focus", p["field"]), ("readonly", p["field"])],
               darkcolor=[("focus", "!readonly", p["accent"]), ("!focus", p["field"]), ("readonly", p["field"])])
+
+        # Drop-down lists (recent computers): the box like a text box, its list in the theme's colours.
+        s.configure("TCombobox", fieldbackground=p["field"], foreground=p["text"], background=p["field"],
+                    bordercolor=p["field_border"], lightcolor=p["field"], darkcolor=p["field"],
+                    arrowcolor=p["muted"], insertcolor=p["text"], padding=(8, 5),
+                    selectbackground=p["field"], selectforeground=p["text"])
+        s.map("TCombobox",
+              fieldbackground=[("readonly", p["field"]), ("disabled", p["field"])],
+              background=[("active", p["field"]), ("pressed", p["field"])],
+              arrowcolor=[("active", p["accent"]), ("pressed", p["accent"])],
+              bordercolor=[("focus", p["accent"])], lightcolor=[("focus", p["accent"])],
+              darkcolor=[("focus", p["accent"])])
+        for option, key in (("background", "field"), ("foreground", "text"), ("selectBackground", "accent")):
+            self.root.option_add(f"*TCombobox*Listbox.{option}", p[key])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.root.option_add("*TCombobox*Listbox.font", (FONT, 11))
+        self.root.option_add("*TCombobox*Listbox.borderWidth", 0)
+        self._restyle_popdowns()
 
         self._checkbox_images()
         for name, bg in (("TCheckbutton", "bg"), ("Card.TCheckbutton", "card")):

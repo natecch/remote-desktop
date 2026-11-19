@@ -20,8 +20,16 @@
   button { cursor: pointer; }
   button:hover { border-color: var(--accent); }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  #stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; background: #000; }
-  #screen { max-width: 100%; max-height: 100%; display: block; outline: none; touch-action: none; }
+  #stage { flex: 1; min-height: 0; display: flex; overflow: auto; background: #000; }
+  #screen { max-width: 100%; max-height: 100%; display: block; outline: none; touch-action: none; margin: auto; flex: none; }
+  .badge { padding: 1px 8px; border-radius: 10px; font-size: 12px; background: #1f242d; color: var(--muted); }
+  .badge.good { color: var(--ok); background: rgba(62,207,142,.14); }
+  .badge.ok { color: #f5b041; background: rgba(245,176,65,.14); }
+  .badge.poor { color: var(--bad); background: rgba(255,107,107,.14); }
+  #reconn { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 6; display: flex; gap: 10px;
+            align-items: center; background: rgba(23,27,34,.95); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+  #reconn[hidden] { display: none; }
+  #recBtn.rec { background: var(--bad); border-color: var(--bad); color: #fff; }
   #rcur { position: absolute; pointer-events: none; z-index: 3; line-height: 0; filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); }
   #rcur[hidden] { display: none; }
   #toast { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); background: rgba(23,27,34,.92); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; z-index: 5; pointer-events: none; }
@@ -39,7 +47,10 @@
   dialog::backdrop { background: rgba(0,0,0,.6); }
   dialog textarea { width: 100%; height: 160px; resize: vertical; }
   dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
-  :fullscreen #bar { display: none; }
+  /* Fullscreen: the toolbar hides above the screen and slides down when the pointer touches the top edge. */
+  :fullscreen #bar { position: fixed; top: 0; left: 0; right: 0; z-index: 20; transform: translateY(-100%);
+                     transition: transform .18s ease; box-shadow: 0 2px 14px rgba(0,0,0,.55); }
+  :fullscreen body.peek #bar { transform: none; }
   #filesDlg h3 { font-size: 14px; margin: 14px 0 8px; }
   #filesDlg .head { display: flex; justify-content: space-between; align-items: center; }
   #filesDlg .hint, #filesDlg .status { color: var(--muted); font-size: 13px; }
@@ -67,12 +78,13 @@
 </head>
 <body>
 <div id="bar">
-  <div id="status"><span id="dot"></span><span id="stat">Disconnected</span></div>
+  <div id="status"><span id="dot"></span><span id="stat">Disconnected</span><span id="ping" class="badge" title="Round trip to the remote computer">– ms</span></div>
   <div class="grow"></div>
   <label>Screen <select id="monitor"></select></label>
   <label>Quality
     <select id="quality">
-      <option value="35">Low</option><option value="60" selected>Medium</option>
+      <option value="auto" selected>Auto</option>
+      <option value="35">Low</option><option value="60">Medium</option>
       <option value="80">High</option><option value="92">Best</option>
     </select>
   </label>
@@ -80,6 +92,13 @@
     <select id="scale">
       <option value="1" selected>100%</option><option value="0.75">75%</option>
       <option value="0.5">50%</option><option value="0.35">35%</option>
+    </select>
+  </label>
+  <label>View
+    <select id="view" title="Fit the window, or show actual size and scroll (Ctrl + mouse wheel zooms)">
+      <option value="fit" selected>Fit</option><option value="0.5">50%</option><option value="0.75">75%</option>
+      <option value="1">Actual size</option><option value="1.25">125%</option><option value="1.5">150%</option>
+      <option value="2">200%</option><option value="3">300%</option>
     </select>
   </label>
   <label>FPS
@@ -97,12 +116,15 @@
       <button data-combo="MetaLeft,KeyL">Lock PC</button>
       <button data-combo="ControlLeft,ShiftLeft,Escape">Task Manager</button>
       <button data-combo="PrintScreen">Print Screen</button>
+      <button data-action="restart">Restart remote PC…</button>
     </div>
   </div>
   <button id="pasteBtn" type="button">Type text…</button>
   <button id="filesBtn" type="button">Files…</button>
   <button id="chatBtn" type="button">Chat</button>
   <button id="soundBtn" type="button" title="Hear the remote computer's sound">Sound: off</button>
+  <button id="shotBtn" type="button" title="Save a picture of the remote screen">Screenshot</button>
+  <button id="recBtn" type="button" title="Record the session (picture and sound) to a video file">Record</button>
   <button id="clipBtn" type="button" class="primary" hidden>Copy remote clipboard</button>
   <button id="fsBtn" type="button">Fullscreen</button>
   <button id="discBtn" type="button">Disconnect</button>
@@ -112,6 +134,7 @@
   <canvas id="screen" tabindex="0" width="16" height="9"></canvas>
   <div id="rcur" hidden><svg width="18" height="26" viewBox="0 0 18 26"><path d="M1 1v19.5l5-4.6 3.7 8.8 3.2-1.4-3.7-8.6H16z" fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/></svg></div>
   <div id="toast" hidden></div>
+  <div id="reconn" hidden><span id="reconnText"></span><button id="reconnStop" type="button">Stop</button></div>
   <aside id="chat" hidden>
     <div class="head"><strong>Chat</strong><button id="chatClose" type="button">✕</button></div>
     <div id="chatLog"></div>
@@ -221,6 +244,7 @@ function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj))
 const canControl = () => ready && !viewOnly;
 
 function connect(password) {
+  lastPassword = password;  // kept in memory only, to reconnect after a drop
   $("err").textContent = "Connecting…";
   let denied = false, busy = false, timedOut = false;
   // Never sit on "Connecting…" for ever: give up if the remote computer has not answered.
@@ -240,6 +264,8 @@ function connect(password) {
       else if (m.t === "clip") onClip(String(m.s));
       else if (m.t === "chat") onChat(m);
       else if (m.t === "audio") onAudioInfo(m);
+      else if (m.t === "pong") onPong(m);
+      else if (m.t === "restarting") onRestarting();
       else onFileMsg(m);
       return;
     }
@@ -255,10 +281,18 @@ function connect(password) {
     const wasReady = ready;
     ws = null; ready = false; remoteCur = null;
     updateCursor();
+    $("ping").textContent = "– ms"; $("ping").className = "badge";
     transferReset();
     $("dot").classList.remove("on");
     $("stat").textContent = "Disconnected";
     canvas.classList.remove("control");
+    // Dropped by the network (or the remote PC restarting): try again quietly instead of giving up.
+    if (!denied && ev.reason !== "locked out" && lastPassword && (reconnecting || (wasReady && !userClosed))) {
+      scheduleReconnect();
+      return;
+    }
+    stopReconnect();
+    if (recorder) recorder.stop();
     $("login").style.display = "flex";
     $("err").textContent = denied ? "Wrong password."
       : busy ? "The remote computer's screen is not available right now. Try again in a moment."
@@ -285,7 +319,7 @@ function onScreen(buf, sock) {
   }
   drawChain = drawChain.then(async () => {
     try {
-      if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; updateCursor(); }
+      if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; applyZoom(); }
       for (const r of regions) { const bmp = await r.bmp; ctx.drawImage(bmp, r.x, r.y); bmp.close(); }
       frames++;
     } catch (e) {
@@ -407,12 +441,16 @@ function onSound(buf) {
   const src = ctx.createBufferSource();
   src.buffer = out;
   src.connect(ctx.destination);
+  if (recDest) src.connect(recDest);  // also into a recording
   src.start(playHead);
   playHead += out.duration;
 }
 
 function onReady(m) {
   ready = true; viewOnly = m.viewOnly; hostName = m.host;
+  userClosed = false;
+  if (reconnecting) { stopReconnect(); toast("Reconnected."); }
+  reportHost(m.host);
   showSoundState();
   if (soundWanted) { audioContext(); send({ t: "audio", on: true }); }
   document.title = m.host + " – Remote Desktop";
@@ -429,7 +467,8 @@ function onReady(m) {
 }
 
 function sendConfig() {
-  send({ t: "cfg", monitor: +$("monitor").value, quality: +$("quality").value, scale: +$("scale").value, fps: +$("fps").value });
+  const q = $("quality").value === "auto" ? autoQuality : +$("quality").value;
+  send({ t: "cfg", monitor: +$("monitor").value, quality: q, scale: +$("scale").value, fps: +$("fps").value });
 }
 
 setInterval(() => {
@@ -441,8 +480,9 @@ setInterval(() => {
 $("loginForm").addEventListener("submit", e => { e.preventDefault(); if (!ws) connect($("pw").value); });
 for (const id of ["monitor", "quality", "scale", "fps"])
   $(id).addEventListener("change", e => { sendConfig(); e.target.blur(); canvas.focus(); });
-$("discBtn").addEventListener("click", () => { if (ws) ws.close(); });
+$("discBtn").addEventListener("click", () => { userClosed = true; stopReconnect(); if (ws) ws.close(); });
 $("fsBtn").addEventListener("click", async () => {
+  if (document.fullscreenElement) { await document.exitFullscreen(); return; }
   await document.documentElement.requestFullscreen();
   // In fullscreen, capture system shortcuts (Alt+Tab, Win, Esc) where the browser allows it.
   if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(() => {});
@@ -451,6 +491,7 @@ $("fsBtn").addEventListener("click", async () => {
 $("keysBtn").addEventListener("click", e => { e.stopPropagation(); $("keymenu").classList.toggle("open"); });
 document.addEventListener("click", () => $("keymenu").classList.remove("open"));
 $("keymenu").addEventListener("click", e => {
+  if (e.target.dataset.action === "restart") { restartRemote(); return; }
   const combo = e.target.dataset.combo;
   if (!combo || !canControl()) return;
   const codes = combo.split(",");
@@ -515,19 +556,22 @@ function transferReset() {
 
 // `at`: where on the remote screen the files were dropped ({x, y} as 0..1), so the remote
 // computer can put them in the folder or desktop under the pointer.
-async function uploadFiles(fileList, at) {
+// `clip`: files for pasting (Ctrl+V of files copied here): kept for the remote clipboard, progress as a toast.
+async function uploadFiles(fileList, at, clip = false) {
   const files = [...fileList];
-  if (!canControl() || uploading || !files.length) return;
+  if (!canControl() || uploading || !files.length) return false;
   uploading = true;
-  if (!$("filesDlg").open) openFiles();
+  if (!clip && !$("filesDlg").open) openFiles();
   const done = [];
-  const show = line => { $("upStatus").textContent = [...done, line].filter(Boolean).join("\n"); };
+  let allOk = true;
+  const show = clip ? (line => { if (line) toast(line); })
+                    : (line => { $("upStatus").textContent = [...done, line].filter(Boolean).join("\n"); });
   for (const file of files) {
     const id = ++xferId, sock = ws;
     let failed = null;
     upErr = null;
     show(`Sending ${file.name}…`);
-    send({ t: "up_start", id, name: file.name, size: file.size, ...(at || {}) });
+    send({ t: "up_start", id, name: file.name, size: file.size, ...(at || {}), ...(clip ? { clip: true } : {}) });
     let r = await waitFor(id);
     if (r.t !== "up_ready") failed = r.msg;
     try {
@@ -547,15 +591,62 @@ async function uploadFiles(fileList, at) {
       r = await waitFor(id);
       if (r.t !== "up_ok") failed = r.msg;
     }
+    if (failed) allOk = false;
     done.push(failed ? `✗ ${file.name}: ${failed}`
                      : `✓ ${r.name} (${fmtSize(file.size)}) sent to ${r.where || "Received files"}`);
-    show("");
+    show(clip && failed ? `✗ ${file.name}: ${failed}` : "");
   }
   uploading = false;
-  if (canControl()) send({ t: "ls", path: curPath });  // refresh the listing
+  if (canControl() && !clip) send({ t: "ls", path: curPath });  // refresh the listing
+  return allOk;
+}
+
+// ---- copy & paste files between the two computers (needs the desktop app on this side) ----
+let clipUrl = null;
+const filesLabel = files => files.length === 1 ? files[0].n : `${files.length} files`;
+
+// Files copied on the remote computer: the app downloads them onto this computer's clipboard.
+async function onClipFiles(m) {
+  const files = Array.isArray(m.files) ? m.files : [];
+  if (!files.length) return;
+  const label = filesLabel(files);
+  if (!clipUrl) { toast(`${label} copied on the remote PC. Use Files… to download (pasting files needs the desktop app).`); return; }
+  toast(`Copying ${label} from the remote PC…`);
+  try {
+    const res = await fetch(clipUrl, { method: "POST", headers: { "Content-Type": "application/json" },
+                                       body: JSON.stringify({ base: httpBase, files }) });
+    const r = await res.json().catch(() => ({}));
+    toast(r.ok ? `${label} ready: paste with Ctrl+V on this computer.` : `Could not copy ${label}${r.error ? ": " + r.error : "."}`);
+  } catch (e) {
+    toast(`Could not copy ${label}.`);
+  }
+}
+
+// Ctrl+V in the viewer with files copied on this computer: send them, put them on the remote
+// clipboard, then let the Ctrl+V through so they are pasted where the remote focus is.
+async function pushClipFiles() {
+  if (!clipUrl || !canControl()) return false;
+  let offer;
+  try { offer = await (await fetch(clipUrl, { cache: "no-store" })).json(); } catch (e) { return false; }
+  if (!offer || !Array.isArray(offer.files) || !offer.files.length) return false;
+  const label = filesLabel(offer.files);
+  toast(`Sending ${label} to paste on the remote PC…`);
+  const list = [];
+  for (const f of offer.files) {
+    const res = await fetch(`${clipUrl}/${offer.seq}/${f.i}`, { cache: "no-store" }).catch(() => null);
+    if (!res || !res.ok) { toast(`Could not read ${f.n}.`); return true; }
+    list.push(new File([await res.blob()], f.n));
+  }
+  if (!(await uploadFiles(list, null, true))) return true;
+  send({ t: "clipset" });
+  const r = await waitFor("clipset");
+  toast(r.ok ? `Pasting ${label} on the remote PC.` : "The remote PC could not take the files.");
+  return true;
 }
 
 function onFileMsg(m) {
+  if (m.t === "clipfiles") { onClipFiles(m); return; }
+  if (m.t === "clipset") { if (waiters.clipset) { waiters.clipset(m); delete waiters.clipset; } return; }
   if (m.t === "up_ready" || m.t === "up_ok" || m.t === "up_err") {
     if (waiters[m.id]) { waiters[m.id](m); delete waiters[m.id]; }
     else if (m.t === "up_err") upErr = m.msg;
@@ -671,9 +762,9 @@ function updateCursor() {
   }
   arrow.hidden = !show;
   if (!show) return;
-  const r = canvas.getBoundingClientRect(), s = $("stage").getBoundingClientRect();
-  arrow.style.left = (r.left - s.left + m.x * r.width) + "px";
-  arrow.style.top = (r.top - s.top + m.y * r.height) + "px";
+  const stage = $("stage"), r = canvas.getBoundingClientRect(), s = stage.getBoundingClientRect();
+  arrow.style.left = (r.left - s.left + stage.scrollLeft + m.x * r.width) + "px";
+  arrow.style.top = (r.top - s.top + stage.scrollTop + m.y * r.height) + "px";
 }
 canvas.addEventListener("pointerenter", () => { localOver = true; updateCursor(); });
 canvas.addEventListener("pointerleave", () => { localOver = false; updateCursor(); });
@@ -699,6 +790,7 @@ canvas.addEventListener("pointerup", e => {
   send({ t: "u", b: e.button, ...pos(e) });
 });
 canvas.addEventListener("wheel", e => {
+  if (e.ctrlKey) { e.preventDefault(); zoomStep(e.deltaY < 0 ? 1 : -1); return; }  // Ctrl + wheel zooms the view
   if (!canControl()) return;
   e.preventDefault();
   const k = e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 800 : 1;
@@ -717,7 +809,7 @@ function keyHandler(down) {
     const code = e.code, paste = down && code === "KeyV" && (e.ctrlKey || e.metaKey) && !e.repeat;
     // Keys go out in order even when a paste first has to hand over the clipboard.
     keyChain = keyChain.then(async () => {
-      if (paste) await pushClipboard();
+      if (paste && !(await pushClipFiles())) await pushClipboard();  // files first, else text
       send({ t: "k", c: code, down });
     });
   };
@@ -727,6 +819,178 @@ $("clipBtn").addEventListener("click", copyPendingClip);
 window.addEventListener("keydown", keyHandler(true));
 window.addEventListener("keyup", keyHandler(false));
 window.addEventListener("blur", () => send({ t: "rel" }));  // release held keys when focus leaves
+
+// ---- connection quality: round-trip badge and automatic picture quality ----
+const AUTO_STEPS = [25, 35, 45, 60, 72, 85];
+let autoQuality = 60, slowCount = 0, fastCount = 0;
+setInterval(() => { if (ready) send({ t: "ping", c: performance.now() }); }, 2000);
+function onPong(m) {
+  const rtt = performance.now() - m.c;
+  if (!(rtt >= 0)) return;
+  const badge = $("ping");
+  badge.textContent = Math.round(rtt) + " ms";
+  badge.className = "badge " + (rtt < 100 ? "good" : rtt < 250 ? "ok" : "poor");
+  badge.title = "Round trip to the remote computer: " + (rtt < 100 ? "good" : rtt < 250 ? "fair" : "slow");
+  if ($("quality").value !== "auto") return;
+  // Slow replies mean the link is backed up: lower the picture quality; raise it again when it recovers.
+  if (rtt > 300) { slowCount++; fastCount = 0; } else if (rtt < 120) { fastCount++; slowCount = 0; } else { slowCount = fastCount = 0; }
+  const i = AUTO_STEPS.indexOf(autoQuality);
+  if (slowCount >= 2 && i > 0) { autoQuality = AUTO_STEPS[i - 1]; slowCount = 0; sendConfig(); }
+  else if (fastCount >= 8 && i < AUTO_STEPS.length - 1) { autoQuality = AUTO_STEPS[i + 1]; fastCount = 0; sendConfig(); }
+}
+
+// ---- reconnect after a dropped connection ----
+let reconnecting = null, userClosed = false, lastPassword = null, resolveUrl = null, restartPending = false;
+function scheduleReconnect() {
+  if (!reconnecting) {
+    reconnecting = { attempt: 0, restart: restartPending, until: Date.now() + (restartPending ? 8 : 3) * 60000 };
+    restartPending = false;
+  }
+  const r = reconnecting;
+  if (Date.now() > r.until) {
+    stopReconnect();
+    if (recorder) recorder.stop();
+    $("login").style.display = "flex";
+    $("err").textContent = "The connection was lost and could not be restored.";
+    return;
+  }
+  r.attempt++;
+  $("reconn").hidden = false;
+  $("reconnText").textContent = r.restart ? "The remote PC is restarting. Reconnecting when it is back…"
+                                          : `Connection lost. Reconnecting… (try ${r.attempt})`;
+  $("stat").textContent = "Reconnecting…";
+  r.timer = setTimeout(async () => {
+    if (reconnecting !== r) return;
+    if (resolveUrl && r.attempt % 2 === 0) await refreshTarget();  // its internet address may have changed
+    if (reconnecting === r && !ws) connect(lastPassword);
+  }, Math.min(1000 * r.attempt, r.restart ? 10000 : 5000));
+}
+function stopReconnect() {
+  if (reconnecting) clearTimeout(reconnecting.timer);
+  reconnecting = null;
+  $("reconn").hidden = true;
+}
+$("reconnStop").addEventListener("click", () => {
+  userClosed = true;
+  stopReconnect();
+  if (ws) ws.close(); else { $("login").style.display = "flex"; $("err").textContent = "Disconnected."; }
+});
+async function refreshTarget() {
+  try {
+    const res = await fetch(resolveUrl, { cache: "no-store" });
+    if (!res.ok) return;
+    const info = await res.json();
+    if (typeof info.ws === "string" && /^wss?:\/\/[a-z0-9.:-]+\/ws$/.test(info.ws)) wsTarget = info.ws;
+  } catch (e) {}
+}
+
+// ---- restart the remote computer, then reconnect ----
+function restartRemote() {
+  if (!canControl()) return;
+  if (!confirm(`Restart ${hostName || "the remote computer"} now?\n\nUnsaved work there will be lost. ` +
+               "This window reconnects when it is back (it must sign in and start sharing by itself).")) return;
+  send({ t: "restart" });
+}
+function onRestarting() {
+  restartPending = true;
+  toast("The remote PC is restarting…");
+}
+
+// ---- view: fit to the window, or a zoom level with scrolling ----
+const ZOOM_LEVELS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
+let zoom = "fit";
+function applyZoom() {
+  if (zoom === "fit") {
+    canvas.style.width = canvas.style.height = canvas.style.maxWidth = canvas.style.maxHeight = "";
+  } else {
+    const dpr = window.devicePixelRatio || 1;  // "Actual size": one remote pixel per screen pixel
+    canvas.style.maxWidth = canvas.style.maxHeight = "none";
+    canvas.style.width = Math.round(canvas.width * zoom / dpr) + "px";
+    canvas.style.height = Math.round(canvas.height * zoom / dpr) + "px";
+  }
+  updateCursor();
+}
+function setZoom(z) {
+  zoom = z;
+  $("view").value = String(z);
+  applyZoom();
+}
+function zoomStep(dir) {
+  const dpr = window.devicePixelRatio || 1;
+  const now = canvas.getBoundingClientRect().width * dpr / canvas.width;  // the zoom on screen right now
+  if (dir > 0) setZoom(ZOOM_LEVELS.find(z => z > now + 0.01) || ZOOM_LEVELS[ZOOM_LEVELS.length - 1]);
+  else { const lower = ZOOM_LEVELS.filter(z => z < now - 0.01); setZoom(lower.length ? lower[lower.length - 1] : "fit"); }
+}
+$("view").addEventListener("change", e => { setZoom(e.target.value === "fit" ? "fit" : +e.target.value); e.target.blur(); canvas.focus(); });
+$("stage").addEventListener("scroll", updateCursor);
+window.addEventListener("resize", () => { if (zoom !== "fit") applyZoom(); });
+
+// ---- fullscreen: the toolbar appears when the pointer touches the top edge ----
+let peekTimer = null;
+document.addEventListener("mousemove", e => {
+  if (!document.fullscreenElement) return;
+  const body = document.body;
+  if (e.clientY <= 4) { clearTimeout(peekTimer); body.classList.add("peek"); }
+  else if (body.classList.contains("peek") && e.clientY > $("bar").offsetHeight + 40 && !$("keymenu").classList.contains("open")) {
+    clearTimeout(peekTimer);
+    peekTimer = setTimeout(() => body.classList.remove("peek"), 500);
+  }
+});
+document.addEventListener("fullscreenchange", () => {
+  document.body.classList.remove("peek");
+  $("fsBtn").textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen";
+});
+
+// ---- screenshot and recording (saved to this computer's Downloads) ----
+const fileStamp = () => new Date().toLocaleString("sv").replace(/[: ]/g, "-");
+const fileHost = () => (hostName || "remote").replace(/[^\w.-]+/g, "_");
+function saveBlob(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
+$("shotBtn").addEventListener("click", () => {
+  if (!ready) return;
+  canvas.toBlob(b => { if (b) { saveBlob(b, `${fileHost()} ${fileStamp()}.png`); toast("Screenshot saved to Downloads."); } }, "image/png");
+  canvas.focus();
+});
+let recorder = null, recDest = null, recTimer = null;
+$("recBtn").addEventListener("click", () => { if (recorder) recorder.stop(); else startRecording(); canvas.focus(); });
+function startRecording() {
+  if (!ready || !window.MediaRecorder) return;
+  const stream = canvas.captureStream(30);
+  if (audioCtx && soundWanted) {  // the remote computer's sound goes into the recording too
+    recDest = audioCtx.createMediaStreamDestination();
+    recDest.stream.getAudioTracks().forEach(track => stream.addTrack(track));
+  }
+  const type = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"].find(t => MediaRecorder.isTypeSupported(t));
+  const chunks = [], started = Date.now();
+  recorder = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 5e6 });
+  recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    saveBlob(new Blob(chunks, { type: "video/webm" }), `${fileHost()} ${fileStamp()}.webm`);
+    stream.getTracks().forEach(track => track.stop());
+    recorder = recDest = null;
+    clearInterval(recTimer);
+    $("recBtn").textContent = "Record";
+    $("recBtn").classList.remove("rec");
+    toast("Recording saved to Downloads.");
+  };
+  recorder.start(1000);
+  $("recBtn").classList.add("rec");
+  const tick = () => { const s = Math.round((Date.now() - started) / 1000);
+                       $("recBtn").textContent = `Stop ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+  tick();
+  recTimer = setInterval(tick, 1000);
+}
+
+// ---- tell the desktop app which computer this is (for its list of recent computers) ----
+let reportUrl = null;
+function reportHost(name) {
+  if (reportUrl) fetch(reportUrl + "?host=" + encodeURIComponent(name || ""), { method: "POST" }).catch(() => {});
+}
 
 // ---- opened by the desktop app: collect the target address (and password) once ----
 (async () => {
@@ -741,6 +1005,9 @@ window.addEventListener("blur", () => send({ t: "rel" }));  // release held keys
     const session = await res.json();
     if (!validTarget(session.ws)) throw new Error("bad target");
     wsTarget = session.ws;
+    if (typeof session.resolve === "string" && session.resolve.startsWith("/resolve/")) resolveUrl = session.resolve;
+    if (typeof session.report === "string" && session.report.startsWith("/report/")) reportUrl = session.report;
+    if (typeof session.clip === "string" && session.clip.startsWith("/clip/")) clipUrl = session.clip;
     try { sessionStorage.setItem("rd_target", wsTarget); } catch (e) {}  // survives a reload; the password is not kept
     if (session.password && !ws) connect(session.password);
   } catch (e) {

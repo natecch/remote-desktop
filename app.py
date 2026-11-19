@@ -112,6 +112,7 @@ WINDOWS, MAC = sys.platform == "win32", sys.platform == "darwin"
 HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # also right when packaged
 TUNNEL_URL = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com")
 MIN_PASSWORD = 10
+MAX_PARTNERS = 12
 
 
 def find_cloudflared():
@@ -241,6 +242,121 @@ def save_settings(password, **fields):
     SETTINGS_FILE.write_text(json.dumps({**secret, **fields}, indent=2), encoding="utf-8")
 
 
+def to_ws(url):
+    """http(s)://host/ -> ws(s)://host/ws"""
+    return url.rstrip("/").replace("https://", "wss://", 1).replace("http://", "ws://", 1) + "/ws"
+
+
+def protect_secret(text):
+    """A saved password: encrypted for this Windows user; elsewhere kept in the settings
+    file that only this user can read."""
+    if WINDOWS:
+        return "dpapi:" + base64.b64encode(_dpapi(text.encode("utf-8"), True)).decode("ascii")
+    return "plain:" + text
+
+
+def reveal_secret(value):
+    try:
+        kind, _, data = str(value).partition(":")
+        if kind == "dpapi" and WINDOWS:
+            return _dpapi(base64.b64decode(data), False).decode("utf-8")
+        if kind == "plain":
+            return data
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+# ---- copy/paste files between this computer and the one being controlled (Windows) ----
+CLIP_FILE_LIMIT = 2 * 1024 ** 3
+
+
+def clipboard_get_request(handler, links, rest, full_path):
+    """GET /clip/<link>            -> files copied on this computer since the last paste here
+       GET /clip/<link>/<seq>/<i>  -> one of those files' contents
+       Files already sent, or ones this app itself put there from the remote side, are not offered."""
+    parts = rest.split("?", 1)[0].split("/")
+    link = links.get(parts[0])
+    if not link:
+        return handler.reply(404, b"not found")
+    if len(parts) == 1:
+        seq = host.inp.clipboard_seq()
+        if seq in (link.get("sent_seq"), link.get("own_seq")):
+            return handler.reply(200, b'{"files": []}', "application/json")
+        files = []
+        for path in (host.inp.clipboard_files() or [])[:50]:
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) <= CLIP_FILE_LIMIT:
+                    files.append(path)
+            except OSError:
+                continue
+        link["offer"] = {"seq": seq, "paths": files}
+        body = {"seq": seq, "files": [{"i": i, "n": os.path.basename(f), "s": os.path.getsize(f)}
+                                      for i, f in enumerate(files)]}
+        return handler.reply(200, json.dumps(body).encode(), "application/json")
+    offer = link.get("offer") or {}
+    try:
+        seq, index = int(parts[1]), int(parts[2])
+        path = offer["paths"][index] if offer.get("seq") == seq else None
+    except (ValueError, IndexError, KeyError):
+        path = None
+    if not path:
+        return handler.reply(404, b"not found")
+    if index == len(offer["paths"]) - 1:
+        link["sent_seq"] = seq  # the whole set has been handed over: don't offer it again
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/octet-stream")
+            handler.send_header("Content-Length", str(size))
+            handler.send_header("Cache-Control", "no-store")
+            handler.end_headers()
+            while chunk := f.read(1 << 20):
+                handler.wfile.write(chunk)
+    except OSError:
+        pass
+
+
+def clipboard_post_request(handler, links, rest):
+    """POST /clip/<link> {"base": ..., "files": [{"n","s","u"}]}: download files copied on the
+    remote computer and put them on this computer's clipboard, ready for Ctrl+V."""
+    link = links.get(rest)
+    if not link:
+        return handler.reply(404, b"not found")
+    try:
+        length = int(handler.headers.get("Content-Length") or 0)
+        request = json.loads(handler.rfile.read(min(length, 1 << 20)))
+        base, files = str(request["base"]), list(request["files"])[:50]
+    except (ValueError, KeyError, TypeError):
+        return handler.reply(400, b"bad request")
+    # Only from the computer this window is connected to.
+    allowed = link["ws"].replace("wss://", "https://", 1).replace("ws://", "http://", 1)[:-len("/ws")]
+    if base.rstrip("/") != allowed.rstrip("/"):
+        return handler.reply(403, b"not this window's computer")
+    import tempfile
+    import urllib.request
+    folder = Path(tempfile.mkdtemp(prefix="RemoteDesktopClip-"))
+    saved = []
+    try:
+        for item in files:
+            u = str(item.get("u", ""))
+            if not u.startswith("/dl/"):
+                continue
+            name = host.safe_name(item.get("n", "file"))
+            target = host.unique_path(folder, name)
+            with urllib.request.urlopen(allowed + u, timeout=60) as response, open(target, "wb") as out:
+                shutil.copyfileobj(response, out, 1 << 20)
+            saved.append(target)
+    except OSError as exc:
+        return handler.reply(502, json.dumps({"ok": False, "error": str(exc)}).encode(), "application/json")
+    import drop_target
+    ok = bool(saved) and drop_target.put_files_on_clipboard(saved, move=False)
+    link["own_seq"] = host.inp.clipboard_seq()  # don't send these straight back on the next paste
+    body = json.dumps({"ok": ok, "count": len(saved)})
+    handler.reply(200, body.encode(), "application/json")
+
+
 class LocalViewer:
     """Serves the viewer page to this PC only, for controlling another computer.
 
@@ -249,14 +365,18 @@ class LocalViewer:
     its connection details once, through a single-use token.
     """
 
-    def __init__(self):
+    def __init__(self, on_report=None):
         self.httpd = None
         self.sessions = {}
+        # Per viewer window, for as long as the app runs: a secret link to look up the partner's
+        # current address again (it changes when the partner restarts) and one to report its name.
+        self.links = {}
+        self.on_report = on_report
 
     def start(self):
         if self.httpd:
             return
-        sessions = self.sessions
+        sessions, links, viewer = self.sessions, self.links, self
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -270,27 +390,67 @@ class LocalViewer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def do_GET(self):
+            def local_only(self):
                 port = self.server.server_address[1]
                 if self.headers.get("Host") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
-                    return self.reply(403, b"forbidden")
+                    self.reply(403, b"forbidden")
+                    return False
+                return True
+
+            def do_GET(self):
+                if not self.local_only():
+                    return
                 path = self.path.split("?", 1)[0]
                 if path in ("/", "/index.html"):
                     return self.reply(200, (HERE / "viewer.html").read_bytes(), "text/html; charset=utf-8")
                 if path.startswith("/session/"):
                     session = sessions.pop(path[len("/session/"):], None)
                     if session and session["expires"] > time.monotonic():
-                        body = json.dumps({"ws": session["ws"], "password": session["password"]})
+                        body = json.dumps({"ws": session["ws"], "password": session["password"],
+                                           "resolve": "/resolve/" + session["link"],
+                                           "report": "/report/" + session["link"],
+                                           "clip": "/clip/" + session["link"] if WINDOWS else None})
                         return self.reply(200, body.encode(), "application/json")
+                if path.startswith("/clip/") and WINDOWS:
+                    return clipboard_get_request(self, links, path[len("/clip/"):], self.path)
+                if path.startswith("/resolve/"):
+                    link = links.get(path[len("/resolve/"):])
+                    if link and link["id"]:
+                        try:
+                            url = rendezvous.lookup(link["id"])
+                        except OSError:
+                            url = None
+                        if url:
+                            link["ws"] = to_ws(url)
+                            return self.reply(200, json.dumps({"ws": link["ws"]}).encode(), "application/json")
                 self.reply(404, b"not found")
+
+            def do_POST(self):
+                if not self.local_only():
+                    return
+                path, _, query = self.path.partition("?")
+                if path.startswith("/clip/") and WINDOWS:
+                    return clipboard_post_request(self, links, path[len("/clip/"):])
+                link = links.get(path[len("/report/"):]) if path.startswith("/report/") else None
+                if not link:
+                    return self.reply(404, b"not found")
+                from urllib.parse import parse_qs
+                host = (parse_qs(query).get("host") or [""])[0].strip()[:80]
+                if host and viewer.on_report:
+                    viewer.on_report(link["key"], host)
+                self.reply(204, b"")
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
-    def open(self, ws_url, password):
+    def open(self, ws_url, password, key=""):
+        """Open a viewer window. `key` is what the user typed (a 9-digit ID or an address)."""
         self.start()
-        token = secrets.token_urlsafe(24)
-        self.sessions[token] = {"ws": ws_url, "password": password, "expires": time.monotonic() + 60}
+        token, link = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+        self.links[link] = {"key": key, "id": rendezvous.digits(key) if rendezvous.is_id(key) else None,
+                            "ws": ws_url}
+        self.sessions[token] = {"ws": ws_url, "password": password, "link": link,
+                                "expires": time.monotonic() + 60}
         open_viewer(f"http://127.0.0.1:{self.httpd.server_address[1]}/?s={token}")
 
 
@@ -407,7 +567,10 @@ class App:
         self.id_ready = False
         self.partner = tk.StringVar()
         self.partner_pw = tk.StringVar()
-        self.viewer = LocalViewer()
+        self.viewer = LocalViewer(on_report=lambda key, host: self.events.put(("partner_name", (key, host))))
+        # Recent and saved computers: [{"key", "name", "pw" (protected), "last"}], newest first.
+        self.partners = [p for p in saved.get("partners", []) if isinstance(p, dict) and p.get("key")][:MAX_PARTNERS]
+        self.remember_pw = tk.BooleanVar(value=False)
         saved_id = str(saved.get("id", ""))
         self.number = saved_id if rendezvous.is_id(saved_id) else rendezvous.new_id()
         self.registered = None      # None = not yet known, True/False = number lookup works or not
@@ -573,19 +736,26 @@ class App:
 
         ctrl = card(cards, "Control a remote computer", "Enter the ID and password shown on the other computer.",
                     row=0, column=1, sticky="nsew", padx=(10, 0))
-        ttk.Label(ctrl, text="Partner ID", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
-        partner_entry = ttk.Entry(ctrl, textvariable=self.partner, font=(theme.FONT, 18))
-        partner_entry.grid(row=3, column=0, sticky="ew")
+        ttk.Label(ctrl, text="Partner ID  (or pick a recent computer)", style="Muted.TLabel"
+                  ).grid(row=2, column=0, columnspan=2, sticky="w")
+        self.partner_box = th.combobox(ttk.Combobox(ctrl, textvariable=self.partner, font=(theme.FONT, 18)))
+        self.partner_box.grid(row=3, column=0, sticky="ew")
+        self.partner_box.bind("<<ComboboxSelected>>", lambda _e: self.pick_partner())
+        self.forget_btn = icon_btn(ctrl, "\uE74D", self.forget_partner, "Remove from the list", size)
+        self.forget_btn.grid(row=3, column=1, padx=(8, 0))
         ttk.Label(ctrl, text="Password", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(12, 0))
         partner_pw_entry = ttk.Entry(ctrl, textvariable=self.partner_pw, show="•", font=(theme.FONT, 14))
-        partner_pw_entry.grid(row=5, column=0, sticky="ew")
-        for entry in (partner_entry, partner_pw_entry):
+        partner_pw_entry.grid(row=5, column=0, columnspan=2, sticky="ew")
+        for entry in (self.partner_box, partner_pw_entry):
             entry.bind("<Return>", lambda _e: self.connect_partner())
+        ttk.Checkbutton(ctrl, text="Remember password", variable=self.remember_pw, style="Card.TCheckbutton"
+                        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 0))
         self.partner_msg = ttk.Label(ctrl, text="", style="Error.TLabel", wraplength=420)
-        self.partner_msg.grid(row=6, column=0, sticky="w", pady=(10, 0))
-        ctrl.rowconfigure(6, weight=1)
+        self.partner_msg.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ctrl.rowconfigure(7, weight=1)
         self.connect_btn = accent(ctrl, "Connect", "indigo", self.connect_partner)
-        self.connect_btn.grid(row=7, column=0, sticky="ew", pady=(14, 0))
+        self.connect_btn.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.refresh_partners()
 
         links = card(page, "Browser access", row=1, column=0, sticky="ew", pady=(16, 0))
         links.columnconfigure(0, weight=0)
@@ -803,6 +973,7 @@ class App:
                           uac_restored=self.uac_restored,
                           last_update_check=self.last_update_check,
                           auto_update=self.auto_update.get(),
+                          partners=self.partners,
                           auto_share_default_done=self.auto_share_default_done,
                           resume_share=self.resume_share,
                           launch_default_done=not self.launch_default_pending)
@@ -1188,17 +1359,78 @@ class App:
         self.my_id.set(ident)
         self.toggle_show()
 
+    # ---- recent and saved computers ----
+    @staticmethod
+    def partner_key(text):
+        text = text.strip()
+        return rendezvous.digits(text) if rendezvous.is_id(text) else text.lower()
+
+    @staticmethod
+    def partner_label(entry):
+        key = entry["key"]
+        shown = rendezvous.pretty(key) if rendezvous.is_id(key) else key
+        mark = "  🔒" if entry.get("pw") else ""
+        return f"{entry['name']}  ·  {shown}{mark}" if entry.get("name") else shown + mark
+
+    def refresh_partners(self):
+        self.partner_box.configure(values=[self.partner_label(e) for e in self.partners])
+
+    def find_partner(self, key):
+        return next((e for e in self.partners if e["key"] == key), None)
+
+    def pick_partner(self):
+        index = self.partner_box.current()
+        if not 0 <= index < len(self.partners):
+            return
+        entry = self.partners[index]
+        key = entry["key"]
+        self.partner.set(rendezvous.pretty(key) if rendezvous.is_id(key) else key)
+        saved_pw = reveal_secret(entry["pw"]) if entry.get("pw") else ""
+        self.partner_pw.set(saved_pw)
+        self.remember_pw.set(bool(saved_pw))
+        self.partner_box.icursor("end")
+
+    def forget_partner(self):
+        entry = self.find_partner(self.partner_key(self.partner.get()))
+        if not entry:
+            return
+        self.partners.remove(entry)
+        self.partner.set("")
+        self.partner_pw.set("")
+        self.remember_pw.set(False)
+        self.refresh_partners()
+        self.save()
+
+    def remember_partner(self, key, password):
+        entry = self.find_partner(key) or {"key": key, "name": "", "pw": ""}
+        if entry in self.partners:
+            self.partners.remove(entry)
+        entry["last"] = time.time()
+        entry["pw"] = protect_secret(password) if self.remember_pw.get() and password else ""
+        self.partners.insert(0, entry)
+        del self.partners[MAX_PARTNERS:]
+        self.refresh_partners()
+        self.save()
+
+    def name_partner(self, key, host):
+        entry = self.find_partner(key)
+        if entry and entry.get("name") != host:
+            entry["name"] = host
+            self.refresh_partners()
+            self.save()
+
     def connect_partner(self):
         text, password = self.partner.get(), self.partner_pw.get()
         self.partner_msg.configure(text="")
         if rendezvous.is_id(text):  # a number: look up its current address first
             self.connect_btn.configure(state="disabled")
+            key = self.partner_key(text)
 
             def work():
                 try:
-                    self.events.put(("lookup", (rendezvous.lookup(text), password, None)))
+                    self.events.put(("lookup", (rendezvous.lookup(text), password, None, key)))
                 except OSError as exc:
-                    self.events.put(("lookup", (None, password, str(exc))))
+                    self.events.put(("lookup", (None, password, str(exc), key)))
             threading.Thread(target=work, daemon=True).start()
             return
         url = partner_url(text)
@@ -1207,13 +1439,15 @@ class App:
                 text="That doesn't look like an ID. Use the 9-digit ID from the other computer "
                      "(or a network address such as 192.168.1.20:8765).")
             return
-        self.launch_viewer(url, password)
+        self.launch_viewer(url, password, self.partner_key(text))
 
-    def launch_viewer(self, url, password):
-        ws_url = url.rstrip("/").replace("https://", "wss://", 1).replace("http://", "ws://", 1) + "/ws"
+    def launch_viewer(self, url, password, key=""):
         self.note("Opening the viewer window.")
-        self.viewer.open(ws_url, password)
-        self.partner_pw.set("")
+        if key:
+            self.remember_partner(key, password)
+        self.viewer.open(to_ws(url), password, key)
+        if not self.remember_pw.get():
+            self.partner_pw.set("")
 
     def refresh(self):
         self.update_id()
@@ -1300,15 +1534,17 @@ class App:
                         self.note("The ID service could not be reached; showing a word ID instead.")
                     self.registered = data[0] or self.registered is True  # one failed refresh changes nothing
                     self.update_id()
+                elif kind == "partner_name":
+                    self.name_partner(*data)
                 elif kind == "lookup":
-                    url, password, error = data
+                    url, password, error, key = data
                     self.connect_btn.configure(state="normal")
                     if error:
                         self.partner_msg.configure(text="Could not reach the ID service. Check your internet connection.")
                     elif not url:
                         self.partner_msg.configure(text="No computer is sharing under that ID right now.")
                     else:
-                        self.launch_viewer(url, password)
+                        self.launch_viewer(url, password, key)
                 elif kind == "tunnel_closed" and self.state == "running":
                     self.addr["net"].set("Tunnel stopped - restart sharing to reconnect")
                     self.update_id()
