@@ -39,7 +39,7 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 # elevated variant is a scheduled task with "run with highest privileges".
 TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>
+  {triggers}
   <Principals><Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
@@ -51,6 +51,46 @@ TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
   <Actions Context="Author"><Exec><Command>{exe}</Command><Arguments>{args}</Arguments></Exec></Actions>
 </Task>
 """
+
+
+LOGON_TRIGGER = "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>"
+
+# Opening the app without a UAC prompt: the installer (which runs as administrator) creates an
+# on-demand task that starts the app with full rights; a normal start hands over to it.
+LAUNCH_NAME = "RemoteDesktop Launch"
+
+
+def launch_task_exists():
+    return sys.platform == "win32" and _schtasks("/Query", "/TN", LAUNCH_NAME).returncode == 0
+
+
+def ensure_launch_task():
+    """Create or update the no-prompt launch task. Needs administrator rights."""
+    import tempfile
+    from xml.sax.saxutils import escape
+    cmd = command()[:-1]  # without --minimized
+    user = f"{os.environ.get('USERDOMAIN', '.')}\\{os.environ.get('USERNAME', '')}"
+    xml = TASK_XML.format(user=escape(user), exe=escape(cmd[0]),
+                          args=escape(subprocess.list2cmdline(cmd[1:])), triggers="<Triggers />")
+    with tempfile.NamedTemporaryFile("w", suffix=".xml", encoding="utf-16", delete=False) as f:
+        f.write(xml)
+    try:
+        result = _schtasks("/Create", "/F", "/TN", LAUNCH_NAME, "/XML", f.name)
+    finally:
+        os.unlink(f.name)
+    if result.returncode != 0:
+        raise OSError((result.stderr or result.stdout).strip() or "Could not create the launch task.")
+
+
+def start_elevated(minimized=False):
+    """Start the app with full rights through a task, without a UAC prompt. True if started.
+    A hidden start (sign-in, after an update) uses the sign-in task, which passes --minimized."""
+    if sys.platform != "win32":
+        return False
+    for name in ((NAME, LAUNCH_NAME) if minimized else (LAUNCH_NAME,)):
+        if _schtasks("/Run", "/TN", name).returncode == 0:
+            return True
+    return False
 
 
 def _schtasks(*args):
@@ -80,7 +120,7 @@ def _set_windows(enabled, elevated, cmd):
         from xml.sax.saxutils import escape
         user = f"{os.environ.get('USERDOMAIN', '.')}\\{os.environ.get('USERNAME', '')}"
         xml = TASK_XML.format(user=escape(user), exe=escape(cmd[0]),
-                              args=escape(subprocess.list2cmdline(cmd[1:])))
+                              args=escape(subprocess.list2cmdline(cmd[1:])), triggers=LOGON_TRIGGER.format(user=escape(user)))
         with tempfile.NamedTemporaryFile("w", suffix=".xml", encoding="utf-16", delete=False) as f:
             f.write(xml)
         try:

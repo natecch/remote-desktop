@@ -62,7 +62,7 @@ VSVersionInfo(
 "@ | Out-File -Encoding utf8 "$root\build\version_info.txt"
 
 & $Python -m PyInstaller --noconfirm --clean --windowed --name RemoteDesktop `
-    --uac-admin --icon "$root\assets\icon.ico" --version-file "$root\build\version_info.txt" `
+    --icon "$root\assets\icon.ico" --version-file "$root\build\version_info.txt" `
     --add-data "$root\viewer.html;." --add-data "$root\assets\icon-256.png;assets" `
     --add-data "$root\assets\icon.ico;assets" `
     --add-binary "$Cloudflared;bin" `

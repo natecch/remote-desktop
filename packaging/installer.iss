@@ -51,14 +51,17 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "RemoteDesktop"; ValueType: none; Flags: dontcreatekey uninsdeletevalue
 
 [Run]
+; Tasks that start the app with full rights and no UAC prompt (on demand, and at sign-in).
+Filename: "{app}\{#AppExe}"; Parameters: "--setup-tasks"; StatusMsg: "Setting up..."; Flags: runhidden waituntilterminated
 Filename: "{app}\{#AppExe}"; Parameters: "--install-service"; StatusMsg: "Starting the background service..."; Flags: runhidden waituntilterminated; Tasks: service
-Filename: "{app}\{#AppExe}"; Description: "Open {#AppName}"; Flags: nowait postinstall skipifsilent shellexec
-; After a silent update (started by the app itself), start the app again.
-Filename: "{app}\{#AppExe}"; Flags: nowait shellexec; Check: WizardSilent
+Filename: "{app}\{#AppExe}"; Description: "Open {#AppName}"; Flags: nowait postinstall skipifsilent
+; After a silent update (started by the app itself), start it again quietly, in the tray.
+Filename: "{app}\{#AppExe}"; Parameters: "--minimized"; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 Filename: "{app}\{#AppExe}"; Parameters: "--uninstall-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /F /TN RemoteDesktop"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveStartupTask"
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /F /TN ""RemoteDesktop Launch"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveLaunchTask"
 
 [Code]
 // The service and its agent keep RemoteDesktop.exe open; stop them before files are replaced.

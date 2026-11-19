@@ -220,8 +220,19 @@ def install(path):
     """Windows: run the installer silently; it closes this app, updates it and starts it again."""
     if not WINDOWS:
         raise OSError("Open the downloaded file to install it.")
-    subprocess.Popen([str(path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"],
-                     close_fds=True, creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    args = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"]
+    try:
+        subprocess.Popen([str(path), *args], close_fds=True,
+                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 740:  # 740: the installer needs administrator rights
+            raise
+        # This copy runs without full rights: ask Windows to start the installer as administrator.
+        import ctypes
+        shell32 = ctypes.windll.shell32
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        if (shell32.ShellExecuteW(None, "runas", str(path), subprocess.list2cmdline(args), None, 0) or 0) <= 32:
+            raise OSError("Administrator permission was not given, so the update was not installed.") from None
 
 
 def reveal(path):

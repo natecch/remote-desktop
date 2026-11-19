@@ -524,15 +524,17 @@ class Tunnel:
         threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
 
     def _read(self, proc):
-        found = False
+        found, last_error = False, None
         for line in proc.stderr:
             match = None if found else TUNNEL_URL.search(line)
             if match:
                 found = True
                 self.events.put(("tunnel", match.group(0)))
+            elif " ERR " in line:
+                last_error = line.split(" ERR ", 1)[1].strip()[:200]
         proc.wait()
         if proc is self.proc:  # exited on its own, not stopped by us
-            self.events.put(("tunnel_closed", None))
+            self.events.put(("tunnel_closed", last_error))
 
     def stop(self):
         proc, self.proc = self.proc, None
@@ -609,6 +611,8 @@ class App:
         root.minsize(round(860 * scale), round(560 * scale))
         root.geometry(f"{round(900 * scale)}x{round(620 * scale)}")
         root.protocol("WM_DELETE_WINDOW", self.hide_window)  # closing keeps it running in the background
+        # Windows is restarting or signing out: quit at once (hiding here would hold the restart up).
+        root.protocol("WM_SAVE_YOURSELF", lambda: self.on_close(force=True))
         self.theme = theme.Theme(root)  # light or dark, following the system setting
         self.theme.window(root)
         self.build()
@@ -1002,6 +1006,14 @@ class App:
         if self.state == "running":
             params.append("--share")  # carry on sharing after the restart
         params.append("--restarted")  # this copy is closing; the new one must not hand over to it
+        if autostart.launch_task_exists():  # full rights without a UAC prompt
+            self.resume_share = self.state == "running"
+            self.save()
+            self.instance.stop()  # so the new copy doesn't find this one and step aside
+            if autostart.start_elevated():
+                self.on_close(force=True, handoff=True)
+                return
+            self.instance.start()
         self.save()
         shell32 = ctypes.windll.shell32
         shell32.ShellExecuteW.restype = ctypes.c_void_p
@@ -1203,6 +1215,11 @@ class App:
         admin = is_admin()
 
         def work():
+            if WINDOWS and admin:
+                try:
+                    autostart.ensure_launch_task()
+                except OSError:
+                    pass
             try:
                 if WINDOWS and not admin and autostart._task_exists():
                     pass  # already set up by the administrator copy; this copy cannot change it
@@ -1282,6 +1299,7 @@ class App:
     def stop(self):
         self.state = "stopping"
         self.refresh()
+        self.cancel_tunnel_jobs()
         self.tunnel.stop()
         self.server.stop()
         if self.registered:  # mark the number as offline, in the background
@@ -1317,15 +1335,51 @@ class App:
                 self.note("The background service is off: UAC prompts and the sign-in screen "
                           "cannot be controlled. Click Install service.")
         if self.internet.get():
-            self.addr["net"].set("Creating secure address…")
-            try:
-                self.tunnel.start(find_cloudflared(), port)
-            except OSError as exc:
-                self.addr["net"].set("Could not start the tunnel")
-                self.note(f"Tunnel failed to start: {exc}")
+            self.tunnel_port, self.tunnel_tries = port, 0
+            self.start_tunnel()
         else:
             self.addr["net"].set("Off")
         self.refresh()
+
+    # ---- internet tunnel: keep trying until it is up (DNS or network blips must not leave
+    #      this computer unreachable until someone restarts sharing by hand) ----
+    TUNNEL_WAIT = 60  # seconds for a new tunnel to report its address
+
+    def start_tunnel(self):
+        self.tunnel_job = None
+        if self.state != "running" or not self.internet.get():
+            return
+        self.addr["net"].set("Creating secure address…")
+        self.update_id()
+        try:
+            self.tunnel.start(find_cloudflared(), self.tunnel_port)
+        except OSError as exc:
+            return self.retry_tunnel(f"could not start it: {exc}")
+        self.tunnel_watch = self.root.after(self.TUNNEL_WAIT * 1000, self.tunnel_too_slow)
+
+    def tunnel_too_slow(self):
+        self.tunnel_watch = None
+        if self.state == "running" and not TUNNEL_ID.match(self.addr["net"].get()):
+            self.tunnel.stop()
+            self.retry_tunnel("no address after a minute")
+
+    def retry_tunnel(self, reason):
+        if self.state != "running" or not self.internet.get():
+            return
+        self.cancel_tunnel_jobs()
+        self.tunnel_tries += 1
+        delay = min(5 * 2 ** (self.tunnel_tries - 1), 60)
+        self.addr["net"].set(f"Reconnecting to the internet in {delay} s…")
+        self.update_id()
+        self.note(f"Internet link down ({reason}); trying again in {delay} s.")
+        self.tunnel_job = self.root.after(delay * 1000, self.start_tunnel)
+
+    def cancel_tunnel_jobs(self):
+        for name in ("tunnel_job", "tunnel_watch"):
+            job = getattr(self, name, None)
+            if job:
+                self.root.after_cancel(job)
+            setattr(self, name, None)
 
     def on_stopped(self):
         self.state = "stopped"
@@ -1529,6 +1583,8 @@ class App:
                     self.refresh()
                     messagebox.showerror("Could not start", data)
                 elif kind == "tunnel" and self.state == "running":
+                    self.cancel_tunnel_jobs()
+                    self.tunnel_tries = 0
                     self.addr["net"].set(data)
                     self.note("Internet address ready.")
                     self.registered = None
@@ -1551,9 +1607,8 @@ class App:
                     else:
                         self.launch_viewer(url, password, key)
                 elif kind == "tunnel_closed" and self.state == "running":
-                    self.addr["net"].set("Tunnel stopped - restart sharing to reconnect")
-                    self.update_id()
-                    self.note("The internet tunnel stopped unexpectedly.")
+                    self.registered = None
+                    self.retry_tunnel(data or "the tunnel stopped")
         except queue.Empty:
             pass
         self.root.after(150, self.poll)
@@ -1632,6 +1687,21 @@ def selftest():
     return 0 if all(ok for ok, _, _ in results) else 1
 
 
+def setup_tasks():
+    """Installer step (as administrator): the no-prompt launch task and, unless the user turned it
+    off, opening at sign-in, so the app never needs a UAC prompt to start."""
+    try:
+        autostart.ensure_launch_task()
+        saved = load_settings()
+        turned_off = saved.get("launch_default_done") and not autostart.is_enabled()
+        if not turned_off:
+            autostart.set_enabled(True, elevated=True)
+        return 0
+    except OSError as exc:
+        winagent.log(f"--setup-tasks: {exc}")
+        return 1
+
+
 def main():
     if "--selftest" in sys.argv:
         sys.exit(selftest())
@@ -1641,6 +1711,8 @@ def main():
         if "--agent" in sys.argv:
             rest = sys.argv[sys.argv.index("--agent") + 1:]
             sys.exit(winagent.run_agent(int(rest[0]) if rest and rest[0].isdigit() else None))
+        if "--setup-tasks" in sys.argv:  # run by the installer, as administrator
+            sys.exit(setup_tasks())
         for flag, fn in (("--install-service", winagent.install_service),
                          ("--uninstall-service", winagent.uninstall_service)):
             if flag in sys.argv:  # used by the installer and uninstaller
@@ -1658,6 +1730,13 @@ def main():
         # Already running (perhaps hidden in the tray)? Bring that copy forward instead.
         # At sign-in (--minimized) just leave the running copy alone.
         if ask_running_copy("ping" if "--minimized" in sys.argv else "show"):
+            return
+    # Started without administrator rights (Start menu, sign-in entry, after an update): hand over
+    # to the task the installer created, which starts the app with full rights and no UAC prompt.
+    if WINDOWS and not is_admin() and "--no-elevate" not in sys.argv and autostart.launch_task_exists():
+        if "--share" in sys.argv or "--restarted" in sys.argv:
+            time.sleep(1.5)  # a copy that is handing over is still closing
+        if autostart.start_elevated(minimized="--minimized" in sys.argv):
             return
     root = tk.Tk()
     App(root)
