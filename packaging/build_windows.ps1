@@ -2,12 +2,14 @@
 #   powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 # Output: build\dist\RemoteDesktop\ (the app) and build\installer\RemoteDesktopSetup.exe
 #
+# Needs uv (https://docs.astral.sh/uv/): it installs the exact versions in uv.lock,
+# with the Python in .python-version, into .venv.
+#
 # Code signing (removes "Unknown publisher" from Windows' warnings) happens when a
 # certificate is given, either:
 #   -CertThumbprint <sha1>          a certificate in your Windows certificate store, or
 #   $env:SIGN_PFX / $env:SIGN_PFX_PASSWORD   a .pfx file and its password.
 param(
-    [string]$Python = "",        # Python to build with (default: the project's .venv, else "python")
     [string]$Cloudflared = "",   # path to cloudflared.exe to bundle (default: the installed one)
     [string]$CertThumbprint = "",
     [string]$TimestampUrl = "http://timestamp.digicert.com"
@@ -16,11 +18,12 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-if (-not $Python) {
-    $Python = if (Test-Path "$root\.venv\Scripts\python.exe") { "$root\.venv\Scripts\python.exe" } else { "python" }
-}
-& $Python -m pip install --quiet -r requirements.txt pyinstaller
-if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+$uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
+if (-not $uv) { $uv = @("$env:APPDATA\Python\Python315\Scripts\uv.exe", "$env:USERPROFILE\.local\bin\uv.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+if (-not $uv) { throw "uv is not installed: pip install uv  (or see https://docs.astral.sh/uv/)" }
+& $uv sync --frozen --group build
+if ($LASTEXITCODE -ne 0) { throw "uv sync failed" }
+$Python = "$root\.venv\Scripts\python.exe"
 
 $version = (& $Python -c "import version; print(version.VERSION)").Trim()
 $parts = ($version.Split(".") + @("0", "0", "0"))[0..3] | ForEach-Object { [int]($_ -replace '\D', '') }

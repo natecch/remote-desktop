@@ -8,13 +8,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
-VERSION="${VERSION:-$(python3 -c 'import version; print(version.VERSION)')}"
+VERSION="${VERSION:-$(sed -n 's/^VERSION = "\(.*\)"/\1/p' version.py)}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 
-python3 -m venv build/venv
+# uv installs the exact versions in uv.lock (Python from .python-version) into .venv.
+command -v uv >/dev/null || { echo "uv is not installed: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2; exit 1; }
+uv sync --frozen --group build
 # shellcheck disable=SC1091
-. build/venv/bin/activate
-pip install --quiet -r requirements.txt pyinstaller
+. .venv/bin/activate
 
 mkdir -p build/bin build/installer
 curl -fsSL -o build/bin/cloudflared \

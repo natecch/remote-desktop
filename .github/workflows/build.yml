@@ -1,5 +1,6 @@
 # Builds the installers on GitHub's machines.
 # * Run it from the Actions tab: installers appear as downloadable artifacts.
+# * A push to main that changes the code or build files builds them too (no release).
 # * Push a tag like v1.2.0: it also publishes a GitHub Release with all installers.
 #   Installed copies check that repository's latest Release and offer the update.
 # Optional code signing for Windows: add repository secrets SIGN_PFX_BASE64 (the .pfx,
@@ -10,6 +11,9 @@ on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+    branches: [main]
+    paths: ["**.py", "viewer.html", "pyproject.toml", "uv.lock", ".python-version",
+            "packaging/**", "assets/**", ".github/workflows/build.yml"]
 
 permissions:
   contents: read
@@ -19,11 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.13" }
+      - uses: astral-sh/setup-uv@v6   # uv, plus the Python named in .python-version
       - name: Stamp version and update source
-        run: python packaging/stamp_version.py "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}"
-      - run: sudo apt-get update && sudo apt-get install -y python3-tk python3-dev dpkg-dev curl xvfb
+        run: uv run --no-project python packaging/stamp_version.py "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}"
+      - run: sudo apt-get update && sudo apt-get install -y dpkg-dev curl xvfb
       - run: bash packaging/build_linux.sh
       - run: cd build/installer && sha256sum *.deb *.tar.gz > SHA256SUMS-linux.txt
       - uses: actions/upload-artifact@v4
@@ -33,10 +36,9 @@ jobs:
     runs-on: macos-latest   # Apple Silicon (arm64)
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.13" }
+      - uses: astral-sh/setup-uv@v6   # uv, plus the Python named in .python-version
       - name: Stamp version and update source
-        run: python packaging/stamp_version.py "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}"
+        run: uv run --no-project python packaging/stamp_version.py "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}"
       - run: bash packaging/build_macos.sh
       - run: cd build/installer && shasum -a 256 *.dmg > SHA256SUMS-macos.txt
       - uses: actions/upload-artifact@v4
@@ -46,10 +48,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.13" }
+      - uses: astral-sh/setup-uv@v6   # uv, plus the Python named in .python-version
       - name: Stamp version and update source
-        run: python packaging/stamp_version.py "$env:GITHUB_REF_NAME" "$env:GITHUB_REPOSITORY"
+        run: uv run --no-project python packaging/stamp_version.py "$env:GITHUB_REF_NAME" "$env:GITHUB_REPOSITORY"
       - run: choco install innosetup -y --no-progress
       - name: Decode signing certificate
         env: { SIGN_PFX_BASE64: "${{ secrets.SIGN_PFX_BASE64 }}" }
@@ -57,7 +58,7 @@ jobs:
         run: |
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\sign.pfx", [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
           "SIGN_PFX=$env:RUNNER_TEMP\sign.pfx" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-      - run: powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1 -Python python
+      - run: powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
         env: { SIGN_PFX_PASSWORD: "${{ secrets.SIGN_PFX_PASSWORD }}" }
       - uses: actions/upload-artifact@v4
         with: { name: windows-installer, path: "build/installer/*.exe\nbuild/installer/SHA256SUMS-windows.txt" }

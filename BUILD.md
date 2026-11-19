@@ -8,9 +8,23 @@ Each installer has to be built on the operating system it is for.
 | Linux   | `bash packaging/build_linux.sh`                                      | `build/installer/*.deb` and `*.tar.gz`    |
 | macOS   | `bash packaging/build_macos.sh`                                      | `build/installer/*.dmg`                   |
 
-Windows needs Python 3 and Inno Setup 6. Linux needs
-`python3-venv python3-tk python3-dev dpkg-dev curl`. macOS needs Python 3 with Tk.
-Each script bundles Cloudflare's `cloudflared`, which provides internet access.
+Every system needs [uv](https://docs.astral.sh/uv/) (`pip install uv`, or
+`winget install astral-sh.uv` / `curl -LsSf https://astral.sh/uv/install.sh | sh`).
+uv fetches the Python version in `.python-version` and installs the exact package
+versions in `uv.lock` into `.venv`. Windows also needs Inno Setup 6; Linux needs
+`dpkg-dev curl`. Each script bundles Cloudflare's `cloudflared`, which provides
+internet access.
+
+## Running from source
+
+```
+uv sync
+uv run app.py
+```
+
+(`start.bat` does the same on Windows, as administrator.) Dependencies live in
+`pyproject.toml`: add one with `uv add <name>`, then commit `uv.lock`. PyInstaller is in
+the `build` group, installed by `uv sync --group build`.
 
 ## Without a Linux or Mac computer
 

@@ -1,0 +1,24 @@
+[project]
+name = "remote-desktop"
+version = "1.1.4"  # kept equal to version.py; packaging/stamp_version.py sets both
+description = "Share this computer or control another one: screen, mouse and keyboard, files, chat and sound."
+requires-python = ">=3.11"
+dependencies = [
+    "mss",
+    "pillow",
+    "websockets",
+    "numpy",
+    "soundcard",
+    "dxcam; sys_platform == 'win32'",
+    "pynput; sys_platform != 'win32'",
+    "pystray; sys_platform != 'darwin'",
+]
+
+[dependency-groups]
+# Only needed to build the installers (packaging/build_*.ps1 / .sh).
+build = ["pyinstaller"]
+
+[tool.uv]
+# An app run from its folder (python app.py), not a library to install.
+package = false
+default-groups = []
