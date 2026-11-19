@@ -18,15 +18,22 @@ on:
 permissions:
   contents: read
 
+env:
+  UV_PYTHON_PREFERENCE: only-system   # use the Python from setup-python, never download one
+
 jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6   # uv, plus the Python named in .python-version
+      # GitHub's standard Python (version from .python-version): PyInstaller can bundle it
+      # everywhere, unlike uv's own downloaded Python on Linux/macOS.
+      - uses: actions/setup-python@v5
+        with: { python-version-file: .python-version }
+      - uses: astral-sh/setup-uv@v6
       - name: Stamp version and update source
         run: uv run --no-project python packaging/stamp_version.py "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}"
-      - run: sudo apt-get update && sudo apt-get install -y dpkg-dev curl xvfb
+      - run: sudo apt-get update && sudo apt-get install -y python3-tk python3-dev dpkg-dev curl xvfb
       - run: bash packaging/build_linux.sh
       - run: cd build/installer && sha256sum *.deb *.tar.gz > SHA256SUMS-linux.txt
       - uses: actions/upload-artifact@v4
@@ -36,7 +43,11 @@ jobs:
     runs-on: macos-latest   # Apple Silicon (arm64)
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6   # uv, plus the Python named in .python-version
+      # GitHub's standard Python (version from .python-version): PyInstaller can bundle it
+      # everywhere, unlike uv's own downloaded Python on Linux/macOS.
+      - uses: actions/setup-python@v5
+        with: { python-version-file: .python-version }
+      - uses: astral-sh/setup-uv@v6
       - name: Stamp version and update source
         run: uv run --no-project python packaging/stamp_version.py "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}"
       - run: bash packaging/build_macos.sh
@@ -48,7 +59,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6   # uv, plus the Python named in .python-version
+      # GitHub's standard Python (version from .python-version): PyInstaller can bundle it
+      # everywhere, unlike uv's own downloaded Python on Linux/macOS.
+      - uses: actions/setup-python@v5
+        with: { python-version-file: .python-version }
+      - uses: astral-sh/setup-uv@v6
       - name: Stamp version and update source
         run: uv run --no-project python packaging/stamp_version.py "$env:GITHUB_REF_NAME" "$env:GITHUB_REPOSITORY"
       - run: choco install innosetup -y --no-progress
