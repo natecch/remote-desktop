@@ -713,7 +713,11 @@ class App:
 
         share = card(cards, "Allow remote control", "Give this ID and password to the person who will connect.",
                      row=0, column=0, sticky="nsew", padx=(0, 10))
-        ttk.Label(share, text="Your ID", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
+        id_row = ttk.Frame(share, style="Card.TFrame")
+        id_row.grid(row=2, column=0, columnspan=3, sticky="ew")
+        ttk.Label(id_row, text="Your ID", style="Muted.TLabel").pack(side="left")
+        self.id_note = ttk.Label(id_row, text="", style="Warn.TLabel")  # when the ID can't be used right now
+        self.id_note.pack(side="left", padx=(8, 0))
         self.id_entry = ttk.Entry(share, textvariable=self.my_id, font=(theme.FONT, 18, "bold"), width=14)
         self.id_entry.grid(row=3, column=0, sticky="ew")
         size = round(36 * root.winfo_fpixels("1i") / 96)  # one size for every icon button
@@ -1333,23 +1337,30 @@ class App:
         self.refresh()
 
     def update_id(self):
-        """The ID to hand out: this PC's number, or its network address without internet access."""
+        """Your ID always stays this PC's 9-digit number. When it cannot be used right now (no
+        internet link), a short note beside it says why and what to use instead."""
         net, lan = self.addr["net"].get(), self.addr["lan"].get()
         tunnel = TUNNEL_ID.match(net)
         self.id_ready = True
+        note = ""
         if self.state != "running":
+            self.id_note.configure(text="")
             self.toggle_show()  # not sharing: the box holds the editable number, leave it alone
             return
-        if tunnel and self.registered:
-            ident = rendezvous.pretty(self.number)
-        elif tunnel and self.registered is False:
-            ident = tunnel.group(1)  # number service unreachable: fall back to the tunnel's name
+        ident = rendezvous.pretty(self.number)
+        same_network = f"use {lan[len('http://'):]}" if lan.startswith("http://") else ""  # on the same network
+        if tunnel and self.registered is False:
+            note = "ID service down · use the Internet link"
         elif tunnel or net.startswith("Creating"):
-            ident, self.id_ready = "Creating ID…", False
-        elif lan.startswith("http://"):
-            ident = lan[len("http://"):]
-        else:
-            ident, self.id_ready = "No network connection", False
+            if not self.registered:
+                ident, self.id_ready = "Creating ID…", False
+        elif not lan.startswith("http://"):
+            note = "No network connection"
+        elif net == "Off":
+            note = f"Internet off · {same_network}"
+        else:  # the tunnel could not start or stopped
+            note = f"No internet link · {same_network}"
+        self.id_note.configure(text=note)
         self.my_id.set(ident)
         self.toggle_show()
 

@@ -247,7 +247,7 @@ class Theme:
                 ("Status.TLabel", "bg", "text", (FONT, 15, "bold")),
                 ("Page.TLabel", "bg", "text", (FONT, 18, "bold")),
                 ("Pill.TLabel", "card", "text", (FONT, 10, "bold")),
-                ("Error.TLabel", "card", "error", (FONT, 9)), ("Good.TLabel", "card", "green", base)):
+                ("Error.TLabel", "card", "error", (FONT, 9)), ("Warn.TLabel", "card", "amber", (FONT, 9)), ("Good.TLabel", "card", "green", base)):
             s.configure(name, background=p[bg], foreground=p[fg], font=font)
 
         s.configure("TButton", background=p["button"], foreground=p["text"], bordercolor=p["button_border"],
