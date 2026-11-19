@@ -245,11 +245,16 @@ class Theme:
 
         s.configure("TEntry", fieldbackground=p["field"], foreground=p["text"], bordercolor=p["field_border"],
                     lightcolor=p["field"], darkcolor=p["field"], insertcolor=p["text"], padding=(8, 5))
+        # Every text box looks the same whether it can be edited or not (read-only ones only
+        # differ by greyer text when disabled); only the box being typed in turns blue.
         s.map("TEntry",
-              fieldbackground=[("readonly", p["field_ro"]), ("disabled", p["field_ro"])],
+              fieldbackground=[("disabled", p["field"]), ("readonly", p["field"])],
+              background=[("readonly", p["field"]), ("disabled", p["field"])],  # clam greys these
               foreground=[("disabled", p["muted"])],
-              bordercolor=[("focus", p["accent"])],
-              lightcolor=[("focus", p["accent"])], darkcolor=[("focus", p["accent"])])
+              bordercolor=[("focus", "!readonly", p["accent"]), ("!focus", p["field_border"]),
+                           ("readonly", p["field_border"])],
+              lightcolor=[("focus", "!readonly", p["accent"]), ("!focus", p["field"]), ("readonly", p["field"])],
+              darkcolor=[("focus", "!readonly", p["accent"]), ("!focus", p["field"]), ("readonly", p["field"])])
 
         self._checkbox_images()
         for name, bg in (("TCheckbutton", "bg"), ("Card.TCheckbutton", "card")):
