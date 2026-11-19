@@ -1,6 +1,6 @@
 [project]
 name = "remote-desktop"
-version = "1.1.6"  # kept equal to version.py; packaging/stamp_version.py sets both
+version = "1.1.7"  # kept equal to version.py; packaging/stamp_version.py sets both
 description = "Share this computer or control another one: screen, mouse and keyboard, files, chat and sound."
 requires-python = ">=3.11"
 dependencies = [

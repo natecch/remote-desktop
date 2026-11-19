@@ -586,7 +586,6 @@ class App:
         self.tray = tray.Tray(str(HERE / "assets" / "icon-256.png"),
                               lambda action: self.events.put(("tray", action)))
         self.instance = InstanceServer(lambda action: self.events.put(("tray", action)))
-        self.background_notice_shown = False
         self.closed = False
         self.uac_restored = bool(saved.get("uac_restored", False))
         self.last_update_check = float(saved.get("last_update_check", 0))
@@ -1216,12 +1215,7 @@ class App:
         if not self.tray.available:
             self.root.iconify()  # no tray here (macOS): stay in the Dock / taskbar
             return
-        self.root.withdraw()
-        if not self.background_notice_shown:
-            self.background_notice_shown = True
-            what = "sharing this screen" if self.state == "running" else "running"
-            self.tray.notify(f"Remote Desktop is still {what} in the background. "
-                             "Right-click the tray icon to open it or quit.")
+        self.root.withdraw()  # quietly: no "still running in the background" notification
 
     def show_window(self):
         self.root.deiconify()
