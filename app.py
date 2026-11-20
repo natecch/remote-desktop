@@ -1249,6 +1249,8 @@ class App:
         if host.SESSIONS:
             self.show_window()  # so the "a device is connected" question is visible
         self.on_close()
+        if self.closed and WINDOWS:  # quit on purpose: the background service leaves it closed
+            set_quit_flag(True)
 
     # ---- start / stop ----
     def toggle(self):
@@ -1687,6 +1689,19 @@ def selftest():
     return 0 if all(ok for ok, _, _ in results) else 1
 
 
+def set_quit_flag(on):
+    """Tell the background service whether the user quit the app on purpose."""
+    try:
+        flag = winagent.quit_flag()
+        if on:
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text("quit from the tray", encoding="utf-8")
+        else:
+            flag.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def setup_tasks():
     """Installer step (as administrator): the no-prompt launch task and, unless the user turned it
     off, opening at sign-in, so the app never needs a UAC prompt to start."""
@@ -1738,6 +1753,8 @@ def main():
             time.sleep(1.5)  # a copy that is handing over is still closing
         if autostart.start_elevated(minimized="--minimized" in sys.argv):
             return
+    if WINDOWS:
+        set_quit_flag(False)  # running again: the service may restart it if it closes unexpectedly
     root = tk.Tk()
     App(root)
 

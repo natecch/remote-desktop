@@ -246,11 +246,12 @@ const canControl = () => ready && !viewOnly;
 function connect(password) {
   lastPassword = password;  // kept in memory only, to reconnect after a drop
   $("err").textContent = "Connecting…";
-  let denied = false, busy = false, timedOut = false;
+  let denied = false, busy = false, timedOut = false, opened = false;
   // Never sit on "Connecting…" for ever: give up if the remote computer has not answered.
   const giveUp = setTimeout(() => { if (ws === sock && !ready) { timedOut = true; sock.close(); } }, 15000);
   const sock = new WebSocket(wsTarget || ((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"));
   sock.binaryType = "arraybuffer";
+  sock.onopen = () => { opened = true; };
   ws = sock;
   httpBase = sock.url.replace(/^ws/, "http").replace(/\/ws$/, "");  // for drag-out download links
   sock.onmessage = async ev => {
@@ -296,6 +297,9 @@ function connect(password) {
     $("login").style.display = "flex";
     $("err").textContent = denied ? "Wrong password."
       : busy ? "The remote computer's screen is not available right now. Try again in a moment."
+      : timedOut && !opened ? "Could not reach the remote computer's address. It may have stopped sharing " +
+          "(its address changes each time it starts sharing), or this network could not look the address up. " +
+          "Connect again by its ID in the app, or try again in a minute."
       : timedOut ? "The remote computer did not respond. Check that it is on and sharing, then try again."
       : ev.reason === "locked out" ? "Too many attempts. Try again in a minute."
       : wasReady ? "Connection closed." : "Could not connect to the host.";

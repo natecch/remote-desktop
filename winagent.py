@@ -351,11 +351,56 @@ def launch_in_session(session, cmd):
                 kernel32.CloseHandle(handle)
 
 
+# ---- keeping the app itself running (after updates, crashes, or anything else that closed it) ----
+APP_PORT = 47613          # the app answers "ping" here while it runs (app.InstanceServer)
+APP_CHECK_EVERY = 20      # seconds
+APP_RESTART_GAP = 90      # never start it more often than this
+
+
+def quit_flag():
+    """Present while the user has quit the app on purpose (tray > Quit): then leave it closed."""
+    return data_dir() / "app-quit"
+
+
+def app_running():
+    try:
+        with socket.create_connection(("127.0.0.1", APP_PORT), timeout=2) as conn:
+            conn.sendall(b"ping\n")
+            return conn.recv(16).startswith(b"ok")
+    except OSError:
+        return False
+
+
+def app_wanted():
+    """The user has "open when I sign in" on (its task exists and is enabled) and hasn't quit."""
+    if quit_flag().exists():
+        return False
+    result = subprocess.run(["schtasks", "/Query", "/TN", "RemoteDesktop", "/FO", "CSV", "/NH"],
+                            capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return result.returncode == 0 and "Disabled" not in result.stdout
+
+
+def start_app():
+    """Start the app in the signed-in user's session, hidden, with full rights (its sign-in task)."""
+    result = subprocess.run(["schtasks", "/Run", "/TN", "RemoteDesktop"], capture_output=True, text=True,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return result.returncode == 0
+
+
 def supervise(stop):
-    """Keep one agent in the active console session until `stop` (threading.Event) is set."""
+    """Keep one agent in the active console session, and the app running, until `stop` is set."""
     process = pid = session = None
     last_start = -1e9
+    next_app_check, last_app_start = time.monotonic() + APP_CHECK_EVERY, -1e9
     while not stop.is_set():
+        if time.monotonic() >= next_app_check:
+            next_app_check = time.monotonic() + APP_CHECK_EVERY
+            active_session = kernel32.WTSGetActiveConsoleSessionId()
+            if (active_session not in (NO_SESSION, 0) and time.monotonic() - last_app_start > APP_RESTART_GAP
+                    and not app_running() and app_wanted()):
+                last_app_start = time.monotonic()
+                log("service: the app was not running; starting it" if start_app()
+                    else "service: the app was not running and could not be started")
         active = kernel32.WTSGetActiveConsoleSessionId()
         alive = process is not None and kernel32.WaitForSingleObject(process, 0) == WAIT_TIMEOUT
         if not (alive and session == active):
