@@ -243,24 +243,126 @@ function hmacHex(keyStr, msgStr) {
 function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 const canControl = () => ready && !viewOnly;
 
-function connect(password) {
+// ---- direct peer-to-peer link (WebRTC), tried once signed in over the first link ----
+// The remote computer answers through the first link. If the two computers can reach each other
+// directly, this window signs in again over the data channel and drops the first link, so the
+// picture stops travelling through a relay. Messages are split into 16 KB pieces; the first byte
+// of each says whether more pieces follow (bit 0) and whether the message is text (bit 1).
+const STUN = ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"];
+const PIECE = 16 * 1024;
+class ChannelSock {
+  constructor(pc, channel) {
+    this.pc = pc; this.ch = channel; this.parts = []; this.size = 0; this.ended = false;
+    this.url = ""; this.direct = true; this.onmessage = this.onclose = null;
+    channel.binaryType = "arraybuffer";
+    channel.onmessage = ev => this.piece(ev.data);
+    channel.onclose = () => this.end();
+    pc.onconnectionstatechange = () => { if (["failed", "closed"].includes(pc.connectionState)) this.end(); };
+  }
+  get readyState() { return !this.ended && this.ch.readyState === "open" ? 1 : 3; }
+  get bufferedAmount() { return this.ch.bufferedAmount; }
+  send(data) {
+    if (this.readyState !== 1) return;
+    const text = typeof data === "string";
+    const body = text ? new TextEncoder().encode(data)
+               : data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    const last = Math.floor(Math.max(body.length - 1, 0) / PIECE);
+    for (let i = 0; i <= last; i++) {
+      const part = body.subarray(i * PIECE, (i + 1) * PIECE), piece = new Uint8Array(part.length + 1);
+      piece[0] = (text ? 2 : 0) | (i < last ? 1 : 0);
+      piece.set(part, 1);
+      this.ch.send(piece);
+    }
+  }
+  piece(data) {
+    if (!(data instanceof ArrayBuffer) || !data.byteLength) return;
+    const u = new Uint8Array(data);
+    this.parts.push(u.subarray(1)); this.size += u.length - 1;
+    if (this.size > 64 * 1024 * 1024) return this.end();
+    if (u[0] & 1) return;
+    const all = new Uint8Array(this.size);
+    let o = 0;
+    for (const part of this.parts) { all.set(part, o); o += part.length; }
+    this.parts = []; this.size = 0;
+    if (this.onmessage) this.onmessage({ data: u[0] & 2 ? new TextDecoder().decode(all) : all.buffer });
+  }
+  close() { this.end(); }
+  end() {
+    if (this.ended) return;
+    this.ended = true;
+    try { this.ch.close(); } catch (e) {}
+    try { this.pc.close(); } catch (e) {}
+    setTimeout(() => { if (this.onclose) this.onclose({ reason: "" }); }, 0);
+  }
+}
+
+async function tryDirect(base, password) {
+  if (!window.RTCPeerConnection || ws !== base) return;
+  const pc = new RTCPeerConnection({ iceServers: [{ urls: STUN }] });
+  const channel = pc.createDataChannel("rd", { ordered: true });
+  let settled = false;
+  const fail = () => { if (!settled) { settled = true; try { pc.close(); } catch (e) {} } };
+  base.rtc = { fail, answer: sdp => pc.setRemoteDescription({ type: "answer", sdp }).catch(fail) };
+  channel.onopen = () => { if (settled) return; settled = true; connect(password, { pc, channel, base }); };
+  setTimeout(fail, 20000);  // no direct route: stay on the first link
+  try {
+    await pc.setLocalDescription(await pc.createOffer());
+    await new Promise(done => {  // wait for this side's addresses (at most 3 s)
+      if (pc.iceGatheringState === "complete") return done();
+      pc.addEventListener("icegatheringstatechange", () => { if (pc.iceGatheringState === "complete") done(); });
+      setTimeout(done, 3000);
+    });
+  } catch (e) { return fail(); }
+  if (ws !== base || settled) return fail();
+  base.send(JSON.stringify({ t: "rtc_offer", sdp: pc.localDescription.sdp }));
+}
+
+// Which way the picture travels, shown in the status bar.
+function routeOf(sock) {
+  if (sock.direct) return "Direct";
+  const host = (sock.url.match(/^wss?:\/\/([^/:]+)/) || [])[1] || "";
+  if (/\.trycloudflare\.com$/.test(host)) return "Via relay";
+  if (host === "localhost" || host === "127.0.0.1") return "This PC";
+  if (/^(10|192\.168|172\.(1[6-9]|2\d|3[01])|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\./.test(host) || /\.local$/.test(host)) return "Local network";
+  return "Internet";
+}
+let route = "";
+
+// `upgrade` ({pc, channel, base}): sign in over a direct link while `base` keeps working, then
+// switch to it.
+function connect(password, upgrade) {
   lastPassword = password;  // kept in memory only, to reconnect after a drop
-  $("err").textContent = "Connecting…";
+  if (!upgrade) $("err").textContent = "Connecting…";
   let denied = false, busy = false, timedOut = false, opened = false;
   // Never sit on "Connecting…" for ever: give up if the remote computer has not answered.
-  const giveUp = setTimeout(() => { if (ws === sock && !ready) { timedOut = true; sock.close(); } }, 15000);
-  const sock = new WebSocket(wsTarget || ((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"));
-  sock.binaryType = "arraybuffer";
-  sock.onopen = () => { opened = true; };
-  ws = sock;
-  httpBase = sock.url.replace(/^ws/, "http").replace(/\/ws$/, "");  // for drag-out download links
+  const giveUp = setTimeout(() => {
+    if (upgrade ? ws !== sock : ws === sock && !ready) { timedOut = true; sock.close(); }
+  }, 15000);
+  const sock = upgrade ? new ChannelSock(upgrade.pc, upgrade.channel)
+             : new WebSocket(wsTarget || ((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"));
+  if (!upgrade) {
+    sock.binaryType = "arraybuffer";
+    sock.onopen = () => { opened = true; };
+    ws = sock;
+    httpBase = sock.url.replace(/^ws/, "http").replace(/\/ws$/, "");  // for drag-out download links
+  }
   sock.onmessage = async ev => {
     if (typeof ev.data === "string") {
       const m = JSON.parse(ev.data);
       if (m.t === "hello") sock.send(JSON.stringify({ t: "auth", mac: hmacHex(password, m.nonce) }));
       else if (m.t === "denied") denied = true;
       else if (m.t === "busy") busy = true;
-      else if (m.t === "ready") { clearTimeout(giveUp); onReady(m); }
+      else if (m.t === "ready") {
+        clearTimeout(giveUp);
+        if (upgrade) switchTo(sock, upgrade.base);
+        else {
+          onReady(m);
+          route = routeOf(sock);
+          if (m.direct && (route === "Via relay" || route === "Internet")) setTimeout(() => tryDirect(sock, password), 500);
+        }
+      }
+      else if (m.t === "rtc_answer") { if (sock.rtc) sock.rtc.answer(String(m.sdp)); }
+      else if (m.t === "rtc_none") { if (sock.rtc) sock.rtc.fail(); }
       else if (m.t === "cur") { remoteCur = m; updateCursor(); }
       else if (m.t === "clip") onClip(String(m.s));
       else if (m.t === "chat") onChat(m);
@@ -280,7 +382,7 @@ function connect(password) {
     clearTimeout(giveUp);
     if (ws !== sock) return;
     const wasReady = ready;
-    ws = null; ready = false; remoteCur = null;
+    ws = null; ready = false; remoteCur = null; route = "";
     updateCursor();
     $("ping").textContent = "– ms"; $("ping").className = "badge";
     transferReset();
@@ -305,6 +407,17 @@ function connect(password) {
       : wasReady ? "Connection closed." : "Could not connect to the host.";
     $("pw").focus();
   };
+}
+
+// The direct link is signed in: carry on over it and drop the first link (unless a file is
+// on its way over that one, in which case keep it).
+function switchTo(sock, base) {
+  if (ws !== base || !ready || uploading || dl || Object.keys(waiters).length) { sock.close(); return; }
+  ws = sock; route = "Direct";
+  sendConfig();
+  if (soundWanted) send({ t: "audio", on: true });
+  base.close();
+  toast("Connected directly to the remote computer.");
 }
 
 // A screen update holds only the regions that changed: width u16, height u16, count u8, then
@@ -476,7 +589,7 @@ function sendConfig() {
 }
 
 setInterval(() => {
-  if (ready) $("stat").textContent = `${hostName}${viewOnly ? " (view only)" : ""} · ${frames} fps · ${(bytes / 1024).toFixed(0)} KB/s`;
+  if (ready) $("stat").textContent = `${hostName}${viewOnly ? " (view only)" : ""}${route ? " · " + route : ""} · ${frames} fps · ${(bytes / 1024).toFixed(0)} KB/s`;
   frames = 0; bytes = 0;
 }, 1000);
 

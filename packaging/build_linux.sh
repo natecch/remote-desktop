@@ -30,7 +30,7 @@ pyinstaller --noconfirm --clean --windowed --name RemoteDesktop \
   --hidden-import pynput.keyboard._xorg --hidden-import pynput.mouse._xorg \
   --hidden-import pynput._util.xorg --hidden-import pynput._util.xorg_keysyms \
   --hidden-import pystray._xorg --collect-data soundcard --hidden-import soundcard.pulseaudio \
-  --distpath "$ROOT/build/dist" --workpath "$ROOT/build/work" --specpath "$ROOT/build" app.py
+  --collect-submodules aiortc --collect-submodules aioice --collect-submodules dns \n  --collect-binaries google_crc32c --collect-binaries pylibsrtp --collect-submodules av \n  --distpath "$ROOT/build/dist" --workpath "$ROOT/build/work" --specpath "$ROOT/build" app.py
 # pynput picks its backend at run time, so PyInstaller cannot see it; without a display it
 # also cannot import it to collect it. The explicit hidden imports above cover that.
 

@@ -69,6 +69,8 @@ VSVersionInfo(
     --hidden-import mss.windows --collect-submodules websockets `
     --collect-submodules dxcam --hidden-import comtypes.stream --hidden-import pystray._win32 `
     --collect-data soundcard --hidden-import soundcard.mediafoundation `
+    --collect-submodules aiortc --collect-submodules aioice --collect-submodules dns `
+    --collect-binaries google_crc32c --collect-binaries pylibsrtp --collect-submodules av `
     --distpath "$root\build\dist" --workpath "$root\build\work" --specpath "$root\build" app.py
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 Write-Host "App built: $root\build\dist\RemoteDesktop\RemoteDesktop.exe"

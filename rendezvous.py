@@ -11,6 +11,7 @@ password-challenge connection to it.
 """
 
 import hashlib
+import ipaddress
 import json
 import re
 import secrets
@@ -20,6 +21,9 @@ import urllib.request
 
 SERVICE = "https://ntfy.sh"
 TUNNEL_URL = re.compile(r"^https://[a-z0-9-]{1,63}\.trycloudflare\.com$")
+LAN_ADDRESS = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$")
+SHARED = ipaddress.ip_network("100.64.0.0/10")  # carrier-grade NAT range, also used by Tailscale
+MAX_LAN = 6
 TIMEOUT = 10
 MAX_AGE = 12 * 3600  # ntfy keeps messages about this long
 
@@ -51,14 +55,38 @@ def _request(url, data=None, timeout=TIMEOUT):
         return resp.read(200_000).decode("utf-8", "replace")
 
 
-def publish(ident, url, timeout=TIMEOUT):
-    """Record `url` as the current address for `ident` ('' = offline). Raises OSError on failure."""
-    body = json.dumps({"v": 1, "url": url}).encode()
+def lan_ok(entry):
+    """True for "ip:port" on a private network (192.168.x.x, 10.x.x.x, 172.16-31.x.x, 100.64-127.x.x)."""
+    match = LAN_ADDRESS.match(entry) if isinstance(entry, str) else None
+    if not match or not 1 <= int(match.group(2)) <= 65535:
+        return False
+    try:
+        ip = ipaddress.IPv4Address(match.group(1))
+    except ValueError:
+        return False
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+        return False
+    return ip.is_private or ip in SHARED
+
+
+def publish(ident, url, timeout=TIMEOUT, lan=()):
+    """Record `url` as the current internet address for `ident` ('' = none), and `lan`, the
+    "ip:port" addresses it has on its own network, so a partner on the same network can connect
+    directly. url '' and no lan = offline. Raises OSError on failure."""
+    lan = [entry for entry in lan if lan_ok(entry)][:MAX_LAN]
+    body = json.dumps({"v": 1, "url": url, **({"lan": lan} if lan else {})}).encode()
     _request(f"{SERVICE}/{topic(ident)}", data=body, timeout=timeout)
 
 
 def lookup(ident):
-    """Return the current address for `ident`, or None if unknown or offline. Raises OSError."""
+    """Return the current internet address for `ident`, or None if unknown or offline. Raises OSError."""
+    record = lookup_record(ident)
+    return record["url"] if record else None
+
+
+def lookup_record(ident):
+    """{"url": internet address or None, "lan": ["ip:port", ...]} for `ident`, or None if it is
+    unknown or offline. Raises OSError."""
     text = _request(f"{SERVICE}/{topic(ident)}/json?poll=1&since=12h")
     newest, newest_time = None, -1
     for line in text.splitlines():
@@ -75,4 +103,7 @@ def lookup(ident):
     if not newest or time.time() - newest_time > MAX_AGE:
         return None
     url = newest.get("url")
-    return url if isinstance(url, str) and TUNNEL_URL.match(url) else None
+    url = url if isinstance(url, str) and TUNNEL_URL.match(url) else None
+    lan = newest.get("lan")
+    lan = [entry for entry in lan if lan_ok(entry)][:MAX_LAN] if isinstance(lan, list) else []
+    return {"url": url, "lan": lan} if url or lan else None

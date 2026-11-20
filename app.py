@@ -242,6 +242,31 @@ def save_settings(password, **fields):
     SETTINGS_FILE.write_text(json.dumps({**secret, **fields}, indent=2), encoding="utf-8")
 
 
+def find_partner(ident):
+    """The best address for a partner's 9-digit ID: straight over this network when it is on the
+    same one (fastest, no internet round trip), else its internet address. None if it is offline.
+    Raises OSError when the ID service cannot be reached."""
+    record = rendezvous.lookup_record(ident)
+    if not record:
+        return None
+    want = rendezvous.digits(ident)
+    import concurrent.futures
+    import urllib.request
+
+    def probe(entry):  # the address must answer with the same ID: another PC can have it here
+        try:
+            with urllib.request.urlopen(f"http://{entry}/id", timeout=1.2) as resp:
+                return resp.read(32).decode("ascii", "replace").strip() == want
+        except (OSError, ValueError):
+            return False
+    if record["lan"]:
+        with concurrent.futures.ThreadPoolExecutor(len(record["lan"])) as pool:
+            for entry, ok in zip(record["lan"], pool.map(probe, record["lan"])):
+                if ok:
+                    return f"http://{entry}/"
+    return record["url"]
+
+
 def to_ws(url):
     """http(s)://host/ -> ws(s)://host/ws"""
     return url.rstrip("/").replace("https://", "wss://", 1).replace("http://", "ws://", 1) + "/ws"
@@ -417,7 +442,7 @@ class LocalViewer:
                     link = links.get(path[len("/resolve/"):])
                     if link and link["id"]:
                         try:
-                            url = rendezvous.lookup(link["id"])
+                            url = find_partner(link["id"])
                         except OSError:
                             url = None
                         if url:
@@ -1293,6 +1318,7 @@ class App:
         self.save()
         host.PASSWORD = password
         host.VIEW_ONLY = not self.control.get()
+        host.HOST_ID = self.number
         self.state = "starting"
         self.refresh()
         self.server = Server(self.events)
@@ -1312,9 +1338,13 @@ class App:
         """Publish this PC's address ('' = offline) under its number, without blocking the window."""
         self.last_publish = time.monotonic()
 
+        lan = []
+        if self.state == "running":  # also this PC's own network addresses, for partners nearby
+            lan = [f"{addr}:{self.share_port}" for addr in host.local_addresses()]
+
         def work():
             try:
-                rendezvous.publish(self.number, url)
+                rendezvous.publish(self.number, url, lan=lan)
                 ok = True
             except OSError:
                 ok = False
@@ -1324,6 +1354,8 @@ class App:
 
     def on_started(self, port):
         self.state = "running"
+        self.share_port = port
+        self.register("")  # the ID works on this network at once, before the internet link is up
         self.addr["local"].set(f"http://localhost:{port}")
         lan = host.local_addresses()
         self.addr["lan"].set(f"http://{lan[0]}:{port}" if lan else "No network connection found")
@@ -1489,7 +1521,7 @@ class App:
 
             def work():
                 try:
-                    self.events.put(("lookup", (rendezvous.lookup(text), password, None, key)))
+                    self.events.put(("lookup", (find_partner(text), password, None, key)))
                 except OSError as exc:
                     self.events.put(("lookup", (None, password, str(exc), key)))
             threading.Thread(target=work, daemon=True).start()
@@ -1618,8 +1650,8 @@ class App:
     def tick(self):
         # Re-post the address every half hour so the number never expires at the ID service.
         net = self.addr["net"].get()
-        if self.state == "running" and TUNNEL_ID.match(net) and time.monotonic() - self.last_publish > 1800:
-            self.register(net)
+        if self.state == "running" and time.monotonic() - self.last_publish > 1800:
+            self.register(net if TUNNEL_ID.match(net) else "")
         rows = [(s["ip"], time.strftime("%H:%M:%S", time.localtime(s["since"])))
                 for s in list(host.SESSIONS.values())]
         current = [tuple(self.tree.item(i, "values")) for i in self.tree.get_children()]
@@ -1681,6 +1713,8 @@ def selftest():
     check("screen capture", lambda: f"{len(host.grab_update(0, monitors[0], 1.0, 60, None, -1)[2])} bytes")
     check("input backend", lambda: host.inp.__name__ + " " + str(host.inp.cursor_info()))
     check("viewer page", lambda: f"{len((HERE / 'viewer.html').read_bytes())} bytes")
+    import rtc
+    check("direct link", rtc.selftest)
     check("icon", lambda: f"{(HERE / 'assets' / 'icon-256.png').stat().st_size} bytes")
     check("tunnel program", tunnel)
     check("app window", window)
@@ -1702,9 +1736,30 @@ def set_quit_flag(on):
         pass
 
 
+FIREWALL_RULE = "Remote Desktop"
+
+
+def allow_through_firewall():
+    """Installer step: let partners on the same home or work network reach this app directly
+    (Windows Firewall otherwise blocks them). Private and domain networks only, never public ones."""
+    if not getattr(sys, "frozen", False):
+        return
+    netsh = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "netsh.exe"
+    quiet = {"capture_output": True, "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    try:
+        subprocess.run([str(netsh), "advfirewall", "firewall", "delete", "rule", f"name={FIREWALL_RULE}"], **quiet)
+        for proto in ("TCP", "UDP"):
+            subprocess.run([str(netsh), "advfirewall", "firewall", "add", "rule", f"name={FIREWALL_RULE}",
+                            "dir=in", "action=allow", f"program={sys.executable}", f"protocol={proto}",
+                            "profile=private,domain", "enable=yes"], **quiet)
+    except OSError as exc:
+        winagent.log(f"firewall rule: {exc}")
+
+
 def setup_tasks():
     """Installer step (as administrator): the no-prompt launch task and, unless the user turned it
     off, opening at sign-in, so the app never needs a UAC prompt to start."""
+    allow_through_firewall()
     try:
         autostart.ensure_launch_task()
         saved = load_settings()

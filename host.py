@@ -34,6 +34,7 @@ from websockets.http11 import Response
 
 import audio
 import capture
+import rtc
 
 HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # also right when packaged
 
@@ -151,6 +152,8 @@ def grab_update(index, monitor, scale, quality, previous, previous_version, earl
 
 PASSWORD = ""
 VIEW_ONLY = False
+HOST_ID = ""  # this PC's 9-digit ID, set by the app; /id answers with it so a partner on the
+              # same network can check it found the right computer before connecting directly
 MAX_FAILS, LOCKOUT_SECONDS = 5, 60
 GLOBAL_MAX_FAILS = 30  # across all addresses, in case an attacker rotates IPs
 fails = {}  # ip (or "*" for everyone) -> [count, locked_until]
@@ -169,7 +172,7 @@ def log(msg):
 def client_ip(ws):
     """Peer address. Behind the local Cloudflare tunnel, use the visitor's real IP."""
     ip = ws.remote_address[0]
-    if ip in ("127.0.0.1", "::1"):
+    if ip in ("127.0.0.1", "::1") and ws.request is not None:
         forwarded = ws.request.headers.get("CF-Connecting-IP")
         if forwarded:
             return forwarded.strip()[:64]
@@ -761,6 +764,9 @@ async def receive(ws, st, monitors):
                 st.wake.set()
             elif t == "ping":  # the viewer measures the round trip (shown as a quality badge)
                 await ws.send(json.dumps({"t": "pong", "c": msg.get("c")}))
+            elif t == "rtc_offer" and not isinstance(ws, rtc.ChannelSocket):
+                # The viewer wants a direct link; it signs in again over it once it opens.
+                asyncio.create_task(offer_direct(ws, st, msg.get("sdp")))
             elif t == "restart" and not VIEW_ONLY:
                 log(f"{st.ip}: restarting this computer")
                 await ws.send(json.dumps({"t": "restarting"}))
@@ -790,6 +796,15 @@ async def receive(ws, st, monitors):
                 st.wake.set()  # capture again right away instead of waiting for the next tick
         except (KeyError, ValueError, TypeError):
             continue  # ignore malformed messages
+
+
+async def offer_direct(ws, st, sdp):
+    ip = st.ip if st.ip.endswith(" (direct)") else f"{st.ip} (direct)"
+    answer = await rtc.answer(sdp, ip, handler)
+    try:
+        await ws.send(json.dumps({"t": "rtc_answer", "sdp": answer} if answer else {"t": "rtc_none"}))
+    except ConnectionClosed:
+        pass
 
 
 async def handler(ws):
@@ -833,6 +848,7 @@ async def handler(ws):
         await ws.send(json.dumps({
             "t": "ready",
             "viewOnly": VIEW_ONLY,
+            "direct": rtc.available() and not isinstance(ws, rtc.ChannelSocket),
             "host": socket.gethostname(),
             "monitors": [{"w": m["width"], "h": m["height"]} for m in monitors],
         }))
@@ -872,6 +888,8 @@ async def process_request(connection, request):
         return None  # continue with the WebSocket handshake
     if path.startswith("/dl/"):
         return await serve_link(path[4:])
+    if path == "/id":
+        return http_response(200, "OK", HOST_ID.encode())
     if path in ("/", "/index.html"):
         body = (HERE / "viewer.html").read_bytes()
         return http_response(200, "OK", body, "text/html; charset=utf-8")
@@ -900,7 +918,10 @@ async def run_server(bind, port, ssl_context=None, stop=None, on_ready=None):
                      ssl=ssl_context, compression=None, max_size=1 << 20):
         if on_ready:
             on_ready()
-        await (stop.wait() if stop else asyncio.Future())
+        try:
+            await (stop.wait() if stop else asyncio.Future())
+        finally:
+            await rtc.close_all()  # direct links end with sharing too
 
 
 async def main():

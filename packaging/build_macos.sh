@@ -31,7 +31,7 @@ pyinstaller --noconfirm --clean --windowed --name RemoteDesktop \
   --collect-data soundcard --hidden-import soundcard.coreaudio \
   --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin \
   --hidden-import pynput._util.darwin --hidden-import pynput._util.darwin_vks \
-  --distpath "$ROOT/build/dist" --workpath "$ROOT/build/work" --specpath "$ROOT/build" app.py
+  --collect-submodules aiortc --collect-submodules aioice --collect-submodules dns \n  --collect-binaries google_crc32c --collect-binaries pylibsrtp --collect-submodules av \n  --distpath "$ROOT/build/dist" --workpath "$ROOT/build/work" --specpath "$ROOT/build" app.py
 
 # ---- check the built app actually starts and finds everything ----
 build/dist/RemoteDesktop.app/Contents/MacOS/RemoteDesktop --selftest
