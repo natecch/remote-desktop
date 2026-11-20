@@ -62,8 +62,7 @@ Filename: "{app}\{#AppExe}"; Parameters: "--minimized"; Flags: nowait; Check: Wi
 Filename: "{app}\{#AppExe}"; Parameters: "--uninstall-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /F /TN RemoteDesktop"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveStartupTask"
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /F /TN ""RemoteDesktop Launch"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveLaunchTask"
-Filename: "{sys}
-etsh.exe"; Parameters: "advfirewall firewall delete rule ""name=Remote Desktop"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveFirewallRule"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule ""name=Remote Desktop"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveFirewallRule"
 
 [Code]
 // The service and its agent keep RemoteDesktop.exe open; stop them before files are replaced.
