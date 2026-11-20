@@ -343,6 +343,80 @@ def clipboard_get_request(handler, links, rest, full_path):
         pass
 
 
+def drag_drop_request(handler, links, rest):
+    """POST /drag/<link> {"base": ..., "files": [{"n","s","u"}]}: files dragged off the remote
+    screen were let go outside the viewer window. Copy them into the Explorer window or onto the
+    desktop under the pointer, as a drag between two folders would."""
+    import ctypes.wintypes
+    point = ctypes.wintypes.POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(point))  # where the button was let go
+    link = links.get(rest)
+    if not link:
+        return handler.reply(404, b"not found")
+    try:
+        length = int(handler.headers.get("Content-Length") or 0)
+        request = json.loads(handler.rfile.read(min(length, 1 << 20)))
+        base, files = str(request["base"]), list(request["files"])[:50]
+    except (ValueError, KeyError, TypeError):
+        return handler.reply(400, b"bad request")
+    allowed = link["ws"].replace("wss://", "https://", 1).replace("ws://", "http://", 1)[:-len("/ws")]
+    if base.rstrip("/") != allowed.rstrip("/"):
+        return handler.reply(403, b"not this window's computer")
+    import drop_target
+
+    def answer(**fields):
+        handler.reply(200, json.dumps(fields).encode(), "application/json")
+    try:
+        target = drop_target.folder_at(point.x, point.y)
+    except Exception:
+        target = None
+    if not target:
+        return answer(ok=False, error="Let go over a folder window or the desktop to copy files there.")
+    kind, value = target
+    import tempfile
+    folder = Path(value) if kind == "path" else Path(tempfile.mkdtemp(prefix="RemoteDesktopDrag-"))
+    try:
+        saved = fetch_files(allowed, files, folder)
+    except OSError as exc:
+        return answer(ok=False, error=str(exc))
+    if not saved:
+        return answer(ok=False, error="Nothing was copied.")
+    if kind == "path":
+        where = "the desktop" if folder == drop_target.desktop_folder() else folder.name or str(folder)
+        return answer(ok=True, count=len(saved), where=where)
+    # An Explorer window whose folder could not be read: paste the files into it.
+    ok = drop_target.put_files_on_clipboard(saved, move=True) and drop_target.activate(value)
+    if ok:
+        link["own_seq"] = host.inp.clipboard_seq()
+        for code, down in (("ControlLeft", True), ("KeyV", True), ("KeyV", False), ("ControlLeft", False)):
+            host.inp.key_event(code, down)
+    return answer(ok=bool(ok), count=len(saved), where="the open folder",
+                  **({} if ok else {"error": "Could not put the files in that window."}))
+
+
+def fetch_files(allowed, files, folder):
+    """Download offered files ({"n","u"}) from the remote computer at `allowed` into `folder`.
+    Returns the saved paths. Raises OSError."""
+    import urllib.request
+    saved = []
+    for item in files:
+        u = str(item.get("u", ""))
+        if not u.startswith("/dl/"):
+            continue
+        target = host.unique_path(folder, host.safe_name(item.get("n", "file")))
+        try:
+            with urllib.request.urlopen(allowed + u, timeout=60) as response, open(target, "wb") as out:
+                shutil.copyfileobj(response, out, 1 << 20)
+        except OSError:
+            try:
+                target.unlink()  # no half-written file left behind
+            except OSError:
+                pass
+            raise
+        saved.append(target)
+    return saved
+
+
 def clipboard_post_request(handler, links, rest):
     """POST /clip/<link> {"base": ..., "files": [{"n","s","u"}]}: download files copied on the
     remote computer and put them on this computer's clipboard, ready for Ctrl+V."""
@@ -434,7 +508,8 @@ class LocalViewer:
                         body = json.dumps({"ws": session["ws"], "password": session["password"],
                                            "resolve": "/resolve/" + session["link"],
                                            "report": "/report/" + session["link"],
-                                           "clip": "/clip/" + session["link"] if WINDOWS else None})
+                                           "clip": "/clip/" + session["link"] if WINDOWS else None,
+                                           "drag": "/drag/" + session["link"] if WINDOWS else None})
                         return self.reply(200, body.encode(), "application/json")
                 if path.startswith("/clip/") and WINDOWS:
                     return clipboard_get_request(self, links, path[len("/clip/"):], self.path)
@@ -456,6 +531,8 @@ class LocalViewer:
                 path, _, query = self.path.partition("?")
                 if path.startswith("/clip/") and WINDOWS:
                     return clipboard_post_request(self, links, path[len("/clip/"):])
+                if path.startswith("/drag/") and WINDOWS:
+                    return drag_drop_request(self, links, path[len("/drag/"):])
                 link = links.get(path[len("/report/"):]) if path.startswith("/report/") else None
                 if not link:
                     return self.reply(404, b"not found")

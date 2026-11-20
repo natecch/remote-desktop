@@ -491,8 +491,11 @@ CLIP_MAX_FILES = 50
 def clipboard_offer(ws):
     """Files copied on this computer, as download links for the viewer, or None."""
     paths = getattr(inp, "clipboard_files", lambda: None)()
-    if not paths:
-        return None
+    return offer_files(ws, paths) if paths else None
+
+
+def offer_files(ws, paths):
+    """Download links for these files (folders and very large files are left out), or None."""
     offer, now = [], time.monotonic()
     for path in paths[:CLIP_MAX_FILES]:
         target = Path(path)
@@ -506,6 +509,28 @@ def clipboard_offer(ws):
         LINKS[token] = {"path": str(target), "ws": ws, "expires": now + LINK_SECONDS}
         offer.append({"n": target.name, "s": size, "u": "/dl/" + token})
     return offer or None
+
+
+async def drag_out(ws, st, msg, monitors):
+    """The viewer's pointer left its window while dragging from (x, y) on this screen. If that
+    drag is carrying files out of Explorer or the desktop, cancel it here and hand the viewer
+    download links, so its app can drop the files where the pointer is released."""
+    loop = asyncio.get_running_loop()
+    mon = monitors[st.monitor]
+    px = mon["left"] + min(max(float(msg["x"]), 0), 1) * (mon["width"] - 1)
+    py = mon["top"] + min(max(float(msg["y"]), 0), 1) * (mon["height"] - 1)
+    try:
+        paths = await loop.run_in_executor(None, drop_target.dragged_files, px, py)
+    except Exception:
+        paths = []
+    offer = offer_files(ws, paths) if paths else None
+    if offer:  # end the drag here without dropping anything: Esc, then let go of the button
+        st.io.key_event("Escape", True)
+        st.io.key_event("Escape", False)
+        release_all(st)
+        log(f"{st.ip}: dragging {len(offer)} file(s) out")
+    skipped = len(paths) - len(offer or [])
+    await ws.send(json.dumps({"t": "dragout", "files": offer or [], "skipped": skipped}))
 
 
 async def place_dropped(st, final, at, monitors):
@@ -764,6 +789,8 @@ async def receive(ws, st, monitors):
                 st.wake.set()
             elif t == "ping":  # the viewer measures the round trip (shown as a quality badge)
                 await ws.send(json.dumps({"t": "pong", "c": msg.get("c")}))
+            elif t == "dragout" and drop_target and not VIEW_ONLY:
+                await drag_out(ws, st, msg, monitors)
             elif t == "rtc_offer" and not isinstance(ws, rtc.ChannelSocket):
                 # The viewer wants a direct link; it signs in again over it once it opens.
                 asyncio.create_task(offer_direct(ws, st, msg.get("sdp")))
@@ -849,6 +876,7 @@ async def handler(ws):
             "t": "ready",
             "viewOnly": VIEW_ONLY,
             "direct": rtc.available() and not isinstance(ws, rtc.ChannelSocket),
+            "dragOut": bool(drop_target),
             "host": socket.gethostname(),
             "monitors": [{"w": m["width"], "h": m["height"]} for m in monitors],
         }))

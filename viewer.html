@@ -74,6 +74,7 @@
   #chatForm { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--line); }
   #chatInput { flex: 1; min-width: 0; }
   #stage.drop { outline: 3px dashed var(--accent); outline-offset: -6px; }
+  body.dragout, body.dragout #screen { cursor: copy !important; }
 </style>
 </head>
 <body>
@@ -369,6 +370,7 @@ function connect(password, upgrade) {
       else if (m.t === "audio") onAudioInfo(m);
       else if (m.t === "pong") onPong(m);
       else if (m.t === "restarting") onRestarting();
+      else if (m.t === "dragout") onDragOut(m);
       else onFileMsg(m);
       return;
     }
@@ -564,7 +566,7 @@ function onSound(buf) {
 }
 
 function onReady(m) {
-  ready = true; viewOnly = m.viewOnly; hostName = m.host;
+  ready = true; viewOnly = m.viewOnly; hostName = m.host; dragOutOk = !!m.dragOut;
   userClosed = false;
   if (reconnecting) { stopReconnect(); toast("Reconnected."); }
   reportHost(m.host);
@@ -887,9 +889,46 @@ canvas.addEventListener("pointerenter", () => { localOver = true; updateCursor()
 canvas.addEventListener("pointerleave", () => { localOver = false; updateCursor(); });
 window.addEventListener("resize", updateCursor);
 
+// ---- dragging files off the remote screen onto this computer ----
+// A drag that starts on the remote screen and leaves this window asks the remote computer what
+// it is carrying. Files from its Explorer or desktop are then copied wherever the button is let
+// go here (a folder window or the desktop), through the desktop app; anything else carries on.
+let dragUrl = null, dragOutOk = false, outDrag = null;
+const outside = e => e.clientX < 0 || e.clientY < 0 || e.clientX >= innerWidth || e.clientY >= innerHeight;
+function onDragOut(m) {
+  const d = outDrag;
+  if (!d || !d.asked || d.files) return;
+  d.files = Array.isArray(m.files) ? m.files : [];
+  if (!d.files.length) {
+    if (m.skipped) toast("Folders and files over 256 MB can't be dragged out. Use Files… instead.");
+    return;
+  }
+  document.body.classList.add("dragout");
+  if (d.released) finishDragOut(d);
+  else toast(`Let go on your desktop or a folder to copy ${d.files.length === 1 ? d.files[0].n : d.files.length + " files"}.`);
+}
+async function finishDragOut(d) {
+  outDrag = null;
+  document.body.classList.remove("dragout");
+  if (!d.outsideAtRelease) { toast("Drag cancelled."); return; }
+  const label = d.files.length === 1 ? d.files[0].n : `${d.files.length} files`;
+  toast(`Copying ${label}…`);
+  try {
+    const res = await fetch(dragUrl, { method: "POST", headers: { "Content-Type": "application/json" },
+                                       body: JSON.stringify({ base: httpBase, files: d.files }) });
+    const r = await res.json();
+    toast(r.ok ? `Copied ${label} to ${r.where}.` : (r.error || "Could not copy the files."));
+  } catch (e) { toast("Could not copy the files."); }
+}
+
 function flushMove() { if (pendingMove) { send({ t: "m", ...pendingMove }); pendingMove = null; } }
 canvas.addEventListener("pointermove", e => {
   if (!canControl()) return;
+  const d = outDrag;
+  if (d && dragUrl && dragOutOk && outside(e)) {
+    if (!d.asked) { d.asked = true; send({ t: "dragout", ...d.start }); }
+    if (!d.files || d.files.length) return;  // waiting, or carrying files: the remote drag is over
+  }
   if (!pendingMove) requestAnimationFrame(flushMove);
   pendingMove = lastLocal = pos(e);
   lastLocalAt = performance.now();
@@ -899,11 +938,18 @@ canvas.addEventListener("pointerdown", e => {
   if (!canControl()) return;
   e.preventDefault(); canvas.focus(); canvas.setPointerCapture(e.pointerId);
   pendingMove = null;
+  outDrag = e.button === 0 ? { start: pos(e), asked: false, files: null, released: false } : null;
   send({ t: "d", b: e.button, ...pos(e) });
 });
 canvas.addEventListener("pointerup", e => {
   if (!canControl()) return;
   e.preventDefault(); pendingMove = null;
+  const d = e.button === 0 ? outDrag : null;
+  if (d && d.asked && (!d.files || d.files.length)) {
+    d.released = true; d.outsideAtRelease = outside(e);
+    if (d.files) { finishDragOut(d); return; }  // the remote side already let go of its drag
+    setTimeout(() => { if (outDrag === d && !d.files) outDrag = null; }, 5000);
+  } else if (e.button === 0) outDrag = null;
   send({ t: "u", b: e.button, ...pos(e) });
 });
 canvas.addEventListener("wheel", e => {
@@ -1125,6 +1171,7 @@ function reportHost(name) {
     if (typeof session.resolve === "string" && session.resolve.startsWith("/resolve/")) resolveUrl = session.resolve;
     if (typeof session.report === "string" && session.report.startsWith("/report/")) reportUrl = session.report;
     if (typeof session.clip === "string" && session.clip.startsWith("/clip/")) clipUrl = session.clip;
+    if (typeof session.drag === "string" && session.drag.startsWith("/drag/")) dragUrl = session.drag;
     try { sessionStorage.setItem("rd_target", wsTarget); } catch (e) {}  // survives a reload; the password is not kept
     if (session.password && !ws) connect(session.password);
   } catch (e) {

@@ -152,3 +152,62 @@ def put_files_on_clipboard(paths, move=True):
         return True
     finally:
         user32.CloseClipboard()
+
+
+user32.GetParent.argtypes = (wintypes.HWND,)
+user32.GetParent.restype = wintypes.HWND
+
+
+def _in_file_view(hwnd):
+    """True when the window is (inside) the file list of Explorer or the desktop."""
+    while hwnd:
+        if _text(user32.GetClassNameW, hwnd) == "SHELLDLL_DefView":
+            return True
+        hwnd = user32.GetParent(hwnd)
+    return False
+
+
+def dragged_files(x, y):
+    """The files selected in the Explorer window or desktop at (x, y), when (x, y) is on its
+    file list: what a drag that started there is carrying. [] for anything else."""
+    hwnd = user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+    if not hwnd or not _in_file_view(hwnd):
+        return []
+    root = user32.GetAncestor(hwnd, 2) or hwnd  # GA_ROOT
+    cls = _text(user32.GetClassNameW, root)
+    if cls not in DESKTOP_CLASSES and cls not in EXPLORER_CLASSES:
+        return []
+    try:
+        import comtypes
+        import comtypes.client
+        from comtypes.automation import VARIANT
+        comtypes.CoInitialize()
+    except Exception:
+        return []
+    try:
+        shell = comtypes.client.CreateObject("Shell.Application")
+        views = []
+        if cls in DESKTOP_CLASSES:
+            _, browser = shell.Windows().FindWindowSW(VARIANT(0), VARIANT(), 8, 1)  # SWC_DESKTOP
+            views.append(("", browser.Document))
+        else:
+            for window in shell.Windows():
+                try:
+                    if int(window.HWND) == int(root):
+                        views.append((str(window.LocationName), window.Document))
+                except Exception:
+                    continue
+            if len(views) > 1:  # Windows 11 tabs share one window: the title names the visible tab
+                title = _text(user32.GetWindowTextW, root)
+                views = [v for v in views if v[0] and title.startswith(v[0])][:1]
+        if len(views) != 1:
+            return []
+        paths = [str(item.Path) for item in views[0][1].SelectedItems()]
+        return [p for p in paths if os.path.exists(p)]
+    except Exception:
+        return []
+    finally:
+        try:
+            comtypes.CoUninitialize()
+        except Exception:
+            pass
